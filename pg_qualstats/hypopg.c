@@ -50,39 +50,6 @@ static Oid min_fake_oid = InvalidOid;
 static bool oid_wraparound = false;
 
 /*--- Functions --- */
-static void
-			hypo_utility_hook(
-#if PG_VERSION_NUM >= 100000
-							  PlannedStmt *pstmt,
-#else
-							  Node *parsetree,
-#endif
-							  const char *queryString,
-#if PG_VERSION_NUM >= 140000
-							  bool readOnlyTree,
-#endif
-#if PG_VERSION_NUM >= 90300
-							  ProcessUtilityContext context,
-#endif
-							  ParamListInfo params,
-#if PG_VERSION_NUM >= 100000
-							  QueryEnvironment *queryEnv,
-#endif
-#if PG_VERSION_NUM < 90300
-							  bool isTopLevel,
-#endif
-							  DestReceiver *dest,
-#if PG_VERSION_NUM < 130000
-							  char *completionTag
-#else
-							  QueryCompletion *qc
-#endif
-							  );
-static ProcessUtility_hook_type prev_utility_hook = NULL;
-
-static void hypo_executorEnd_hook(QueryDesc *queryDesc);
-static ExecutorEnd_hook_type prev_ExecutorEnd_hook = NULL;
-
 
 static Oid hypo_get_min_fake_oid(void);
 get_relation_info_hook_type prev_get_relation_info_hook = NULL;

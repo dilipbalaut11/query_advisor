@@ -8,6 +8,7 @@ PG_CONFIG    ?= pg_config
 
 MODULE_big = pg_qualstats
 OBJS = pg_qualstats.o \
+       generate_advise.o \
        hypopg.o \
        hypopg_index.o \
        import/hypopg_import.o \

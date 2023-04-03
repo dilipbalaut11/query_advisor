@@ -79,7 +79,7 @@ static Oid	BLOOM_AM_OID = InvalidOid;
 
 /*--- Variables exported ---*/
 
-explain_get_index_name_hook_type prev_explain_get_index_name_hook;
+explain_get_index_name_hook_type prev_explain_get_index_name_hook = NULL;
 List	   *hypoIndexes;
 
 /*--- Functions --- */
@@ -1759,9 +1759,6 @@ hypo_create_index(char *sql, BlockNumber *relpages)
 {
 	List	   *parsetree_list;
 	ListCell   *parsetree_item;
-	MemoryContext oldcontext;
-	TupleDesc	tupdesc;
-	Tuplestorestate *tupstore;
 	int			i = 1;
 	Oid			idxid;
 
@@ -1782,7 +1779,6 @@ hypo_create_index(char *sql, BlockNumber *relpages)
 		}
 		else
 		{
-			BlockNumber pages = 0;
 			double		tuples = 0;
 
 			entry = hypo_index_store_parsetree((IndexStmt *) parsetree, sql);
@@ -1790,7 +1786,7 @@ hypo_create_index(char *sql, BlockNumber *relpages)
 			{
 				idxid = entry->oid;
 				if (relpages != NULL)
-					hypo_estimate_index_simple(entry, relpages, &tuples);
+					hypo_estimate_index_simple((hypoIndex *) entry, relpages, &tuples);
 			}
 		}
 		i++;
