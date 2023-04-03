@@ -1178,7 +1178,11 @@ qa_plan_query(QueryInfo *queryinfo, bool *have_internal_subtxn,
 														 querytext,
 														 &paramTypes,
 														 &numparam,
-														 NULL);
+														 NULL
+#ifdef EDB_MINORVERSION_NUM
+														,NULL, NULL
+#endif															 
+														 );
 		if (list_length(queryTreeList) != 1)
 			ereport(ERROR, (errmsg("can only execute a single query")));
 
