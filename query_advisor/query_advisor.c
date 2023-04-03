@@ -13,10 +13,12 @@
 #include "postgres.h"
 
 #include "access/relation.h"
+#include "access/xact.h"
 #include "executor/spi.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "optimizer/optimizer.h"
+#include "parser/analyze.h"
 #include "utils/builtins.h"
 
 #include "include/hypopg.h"
@@ -1174,21 +1176,33 @@ qa_plan_query(QueryInfo *queryinfo, bool *have_internal_subtxn,
 
 		parseTreeNode = (Node *) linitial(parseTreeList);
 
-		queryTreeList = pg_analyze_and_rewrite_varparams((RawStmt *) parseTreeNode,
-														 querytext,
-														 &paramTypes,
-														 &numparam,
-														 NULL
-#ifdef EDB_MINORVERSION_NUM
-														,NULL, NULL
-#endif															 
-														 );
+		query = parse_analyze_varparams((RawStmt *) parseTreeNode,
+										querytext,
+										&paramTypes,
+										&numparam
+#if PG_VERSION_NUM >= 150000
+										, NULL
+#endif
+//#ifdef EDB_MINORVERSION_NUM
+										, NULL, NULL
+//#endif
+										);
+
+#if PG_VERSION_NUM >= 140000
+
+		queryTreeList = pg_rewrite_query(query);
 		if (list_length(queryTreeList) != 1)
 			ereport(ERROR, (errmsg("can only execute a single query")));
 
 		query = (Query *) linitial(queryTreeList);
+#endif
 		hypo_is_enabled = true;
-		plan = pg_plan_query(query, querytext, 0, NULL);
+		plan = pg_plan_query(query,
+#if PG_VERSION_NUM >= 130000
+							 querytext,
+#endif
+							 0,
+							 NULL);
 		hypo_is_enabled = false;
 		qa_plan_cost = plan->planTree->total_cost;
 	}

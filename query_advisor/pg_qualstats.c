@@ -154,12 +154,22 @@ static void pgqs_ExecutorRun(QueryDesc *queryDesc,
 );
 static void pgqs_ExecutorFinish(QueryDesc *queryDesc);
 static void pgqs_ExecutorEnd(QueryDesc *queryDesc);
-static void pgqs_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
-								bool readOnlyTree,
-								ProcessUtilityContext context, ParamListInfo params,
-								QueryEnvironment *queryEnv,
-								DestReceiver *dest, QueryCompletion *qc);
 
+static void pgqs_ProcessUtility(PlannedStmt *pstmt,
+								const char *queryString,
+#if PG_VERSION_NUM >= 140000
+								bool readOnlyTree,
+#endif
+								ProcessUtilityContext context,
+								ParamListInfo params,
+								QueryEnvironment *queryEnv,
+								DestReceiver *dest,
+#if PG_VERSION_NUM < 130000
+								char *completionTag
+#else
+								QueryCompletion *qc
+#endif
+								);
 static ExecutorStart_hook_type prev_ExecutorStart = NULL;
 static ExecutorRun_hook_type prev_ExecutorRun = NULL;
 static ExecutorFinish_hook_type prev_ExecutorFinish = NULL;
@@ -830,28 +840,60 @@ cleanup:
  * ProcessUtility hook
  */
 static void
-pgqs_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
+pgqs_ProcessUtility(PlannedStmt *pstmt,
+					const char *queryString,
+#if PG_VERSION_NUM >= 140000
 					bool readOnlyTree,
+#endif
 					ProcessUtilityContext context,
-					ParamListInfo params, QueryEnvironment *queryEnv,
-					DestReceiver *dest, QueryCompletion *qc)
+					ParamListInfo params,
+					QueryEnvironment *queryEnv,
+					DestReceiver *dest,
+#if PG_VERSION_NUM < 130000
+					char *completionTag
+#else
+					QueryCompletion *qc
+#endif
+					)
 {
-	is_utility = true;
-
 	PG_TRY();
 	{
+		is_utility = true;
+
 		if (prev_ProcessUtility)
-			prev_ProcessUtility(pstmt, queryString, readOnlyTree,
-								context, params, queryEnv,
-								dest, qc);
+			prev_ProcessUtility(pstmt, queryString,
+#if PG_VERSION_NUM >= 140000
+								readOnlyTree,
+#endif
+								context, params,
+								queryEnv,
+								dest,
+#if PG_VERSION_NUM < 130000
+									completionTag
+#else
+									qc
+#endif
+								);
 		else
-			standard_ProcessUtility(pstmt, queryString, readOnlyTree,
-									context, params, queryEnv,
-									dest, qc);
+			standard_ProcessUtility(pstmt, queryString,
+#if PG_VERSION_NUM >= 140000
+									readOnlyTree,
+#endif
+									context, params,
+									queryEnv,
+									dest,
+#if PG_VERSION_NUM < 130000
+									completionTag
+#else
+									qc
+#endif
+						  );
+		is_utility = false;
 	}
-	PG_FINALLY();
+	PG_CATCH();
 	{
 		is_utility = false;
+		PG_RE_THROW();
 	}
 	PG_END_TRY();
 }
