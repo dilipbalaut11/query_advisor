@@ -1,3 +1,19 @@
+/*"""
+.. function:: query_advisor_index_recommendations()
+
+  Generates index advises based on quals collected so far
+*/
+
+CREATE FUNCTION query_advisor_index_recommendations(
+	min_filter integer DEFAULT 1000,
+	min_selectivity integer DEFAULT 30,
+	OUT index text,
+	OUT estimated_size_in_bytes int8,
+	OUT estimated_pct_cost_reduction float4)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME', 'query_advisor_index_recommendations'
+LANGUAGE C;
+
 
 /*"""
 .. function:: query_advisor_qualstats_reset()
@@ -115,6 +131,16 @@ CREATE FUNCTION query_advisor_qualstats(
 RETURNS SETOF record
 AS 'MODULE_PATHNAME', 'pg_qualstats_2_0'
 LANGUAGE C STRICT VOLATILE;
+
+/*"""
+.. function query_advisor_workload_queries()
+
+  Returns all the workload queries with their associated queryid
+*/
+CREATE FUNCTION query_advisor_qualstats_memory_usage(OUT storage_name text, OUT usage_percentages float4)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME', 'pg_qualstats_status'
+LANGUAGE C;
 
 
 -- Register a view on the function for ease of use.

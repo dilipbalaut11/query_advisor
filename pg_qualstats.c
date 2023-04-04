@@ -294,8 +294,6 @@ _PG_init(void)
 	EnableQueryId();
 #endif
 
-	prev_planner_hook = planner_hook;
-	planner_hook = qa_planner;
 	prev_ExecutorStart = ExecutorStart_hook;
 	ExecutorStart_hook = pgqs_ExecutorStart;
 	prev_ExecutorRun = ExecutorRun_hook;

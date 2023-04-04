@@ -6,8 +6,9 @@ REGRESS_OPTS = --inputdir=test
 #MODULES      = $(patsubst %.c,%,$(wildcard *.c))
 PG_CONFIG    ?= pg_config
 
-MODULE_big = pg_qualstats
+MODULE_big = query_advisor
 OBJS = pg_qualstats.o \
+       query_advisor.o \
        hypopg.o \
        hypopg_index.o \
        import/hypopg_import.o \

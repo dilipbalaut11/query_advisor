@@ -1761,3 +1761,44 @@ hypo_discover_am(char *amname, Oid oid)
 		BLOOM_AM_OID = oid;
 #endif
 }
+
+Oid
+hypo_create_index(char *sql, BlockNumber *relpages)
+{
+	List	   *parsetree_list;
+	ListCell   *parsetree_item;
+	int			i = 1;
+	Oid			idxid = InvalidOid;
+
+	parsetree_list = pg_parse_query(sql);
+
+	foreach(parsetree_item, parsetree_list)
+	{
+		Node	   *parsetree = (Node *) lfirst(parsetree_item);
+		const		hypoIndex *entry;
+
+		parsetree = ((RawStmt *) parsetree)->stmt;
+
+		if (nodeTag(parsetree) != T_IndexStmt)
+		{
+			elog(WARNING,
+				 "hypopg: SQL order #%d is not a CREATE INDEX statement",
+				 i);
+		}
+		else
+		{
+			double		tuples = 0;
+
+			entry = hypo_index_store_parsetree((IndexStmt *) parsetree, sql);
+			if (entry != NULL)
+			{
+				idxid = entry->oid;
+				if (relpages != NULL)
+					hypo_estimate_index_simple((hypoIndex *) entry, relpages, &tuples);
+			}
+		}
+		i++;
+	}
+
+	return idxid;
+}

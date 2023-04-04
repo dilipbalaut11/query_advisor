@@ -121,6 +121,9 @@ PGDLLEXPORT Datum hypopg_relation_size(PG_FUNCTION_ARGS);
 PGDLLEXPORT Datum hypopg_get_indexdef(PG_FUNCTION_ARGS);
 PGDLLEXPORT Datum hypopg_reset_index(PG_FUNCTION_ARGS);
 
+extern bool hypo_index_remove(Oid indexid);
+extern Oid hypo_create_index(char *sql, BlockNumber *relpages);
+extern void hypo_index_reset(void);
 extern explain_get_index_name_hook_type prev_explain_get_index_name_hook;
 hypoIndex *hypo_get_index(Oid indexId);
 const char *hypo_explain_get_index_name_hook(Oid indexId);
@@ -131,6 +134,5 @@ void		hypo_injectHypotheticalIndex(PlannerInfo *root,
 										 RelOptInfo *rel,
 										 Relation relation,
 										 hypoIndex * entry);
-void hypo_hideIndexes(RelOptInfo *rel);
 
 #endif
