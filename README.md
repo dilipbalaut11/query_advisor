@@ -1,1 +1,1 @@
-# query_advisor
+doc/README.md
