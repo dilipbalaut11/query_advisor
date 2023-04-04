@@ -1,4 +1,4 @@
-comment = 'An extension collecting statistics about quals'
+comment = 'An extension to advise indexes'
 default_version = '2.1.0'
 module_pathname = '$libdir/query_advisor'
 relocatable = false

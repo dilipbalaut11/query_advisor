@@ -18,6 +18,7 @@
 #include "catalog/catalog.h"
 #include "commands/explain.h"
 #include "nodes/nodeFuncs.h"
+#include "optimizer/plancat.h"
 #include "utils/memutils.h"
 
 #include "include/hypopg_import.h"
@@ -50,8 +51,12 @@ extern bool isExplain;
 /* GUC for enabling / disabling hypopg during EXPLAIN */
 extern bool hypo_is_enabled;
 extern MemoryContext HypoMemoryContext;
+extern get_relation_info_hook_type prev_get_relation_info_hook;
 
 Oid			hypo_getNewOid(Oid relid);
 void		hypo_reset_fake_oids(void);
-
+void hypo_get_relation_info_hook(PlannerInfo *root,
+				 Oid relationObjectId,
+				 bool inhparent,
+				 RelOptInfo *rel);
 #endif
