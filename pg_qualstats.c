@@ -20,7 +20,7 @@
  * The implementation is heavily inspired by pg_stat_statements
  *
  * Copyright (c) 2014,2017 Ronan Dunklau
- * Copyright (c) 2018-2023, The Powa-Team
+ * Copyright (c) 2018-2022, The Powa-Team
  *-------------------------------------------------------------------------
  */
 #include <limits.h>
@@ -76,6 +76,10 @@
 #include "utils/memutils.h"
 #include "utils/tuplestore.h"
 
+#include "include/hypopg.h"
+#include "include/hypopg_index.h"
+#include "include/pg_qualstats.h"
+
 PG_MODULE_MAGIC;
 
 #define PGQS_NAME_COLUMNS 7		/* number of column added when using
@@ -85,7 +89,6 @@ PG_MODULE_MAGIC;
 #define PGQS_MAX_LOCAL_ENTRIES	(pgqs_max * 0.2)	/* do not track more of
 													 * 20% of possible entries
 													 * in shared mem */
-#define PGQS_CONSTANT_SIZE 80	/* Truncate constant representation at 80 */
 
 #define PGQS_FLAGS (INSTRUMENT_ROWS|INSTRUMENT_BUFFERS)
 
@@ -188,108 +191,6 @@ static void pgqs_set_query_sampled(bool sample);
 #endif
 static bool pgqs_is_query_sampled(void);
 
-
-/*---- Data structures declarations ----*/
-typedef struct pgqsSharedState
-{
-#if PG_VERSION_NUM >= 90400
-	LWLock	   *lock;			/* protects counters hashtable
-								 * search/modification */
-	LWLock	   *querylock;		/* protects query hashtable
-								 * search/modification */
-#else
-	LWLockId	lock;			/* protects counters hashtable
-								 * search/modification */
-	LWLockId	querylock;		/* protects query hashtable
-								 * search/modification */
-#endif
-#if PG_VERSION_NUM >= 90600
-	LWLock	   *sampledlock;	/* protects sampled array search/modification */
-	bool		sampled[FLEXIBLE_ARRAY_MEMBER]; /* should we sample this
-												 * query? */
-#endif
-} pgqsSharedState;
-
-/* Since cff440d368, queryid becomes a uint64 internally. */
-
-#if PG_VERSION_NUM >= 110000
-typedef uint64 pgqs_queryid;
-#else
-typedef uint32 pgqs_queryid;
-#endif
-
-typedef struct pgqsHashKey
-{
-	Oid			userid;			/* user OID */
-	Oid			dbid;			/* database OID */
-	pgqs_queryid queryid;		/* query identifier (if set by another plugin */
-	uint32		uniquequalnodeid;	/* Hash of the const */
-	uint32		uniquequalid;	/* Hash of the parent, including the consts */
-	char		evaltype;		/* Evaluation type. Can be 'f' to mean a qual
-								 * executed after a scan, or 'i' for an
-								 * indexqual */
-} pgqsHashKey;
-
-typedef struct pgqsNames
-{
-	NameData	rolname;
-	NameData	datname;
-	NameData	lrelname;
-	NameData	lattname;
-	NameData	opname;
-	NameData	rrelname;
-	NameData	rattname;
-} pgqsNames;
-
-typedef struct pgqsEntry
-{
-	pgqsHashKey key;
-	Oid			lrelid;			/* LHS relation OID or NULL if not var */
-	AttrNumber	lattnum;		/* LHS attribute Number or NULL if not var */
-	Oid			opoid;			/* Operator OID */
-	Oid			rrelid;			/* RHS relation OID or NULL if not var */
-	AttrNumber	rattnum;		/* RHS attribute Number or NULL if not var */
-	char		constvalue[PGQS_CONSTANT_SIZE]; /* Textual representation of
-												 * the right hand constant, if
-												 * any */
-	uint32		qualid;			/* Hash of the parent AND expression if any, 0
-								 * otherwise. */
-	uint32		qualnodeid;		/* Hash of the node itself */
-
-	int64		count;			/* # of operator execution */
-	int64		nbfiltered;		/* # of lines discarded by the operator */
-	int			position;		/* content position in query text */
-	double		usage;			/* # of qual execution, used for deallocation */
-	double		min_err_estim[2];	/* min estimation error ratio and num */
-	double		max_err_estim[2];	/* max estimation error ratio and num */
-	double		mean_err_estim[2];	/* mean estimation error ratio and num */
-	double		sum_err_estim[2];	/* sum of variances in estimation error
-									 * ratio and num */
-	int64		occurences;		/* # of qual execution, 1 per query */
-} pgqsEntry;
-
-typedef struct pgqsEntryWithNames
-{
-	pgqsEntry	entry;
-	pgqsNames	names;
-} pgqsEntryWithNames;
-
-typedef struct pgqsQueryStringHashKey
-{
-	pgqs_queryid queryid;
-} pgqsQueryStringHashKey;
-
-typedef struct pgqsQueryStringEntry
-{
-	pgqsQueryStringHashKey key;
-
-	/*
-	 * Imperatively at the end of the struct This is actually of length
-	 * query_size, which is track_activity_query_size
-	 */
-	char		querytext[1];
-} pgqsQueryStringEntry;
-
 /*
  * Transient state of the query tree walker - for the meaning of the counters,
  * see pgqsEntry comments.
@@ -313,7 +214,6 @@ typedef struct pgqsWalkerContext
 	char		evaltype;
 	const char *querytext;
 } pgqsWalkerContext;
-
 
 static bool pgqs_whereclause_tree_walker(Node *node, pgqsWalkerContext *query);
 static pgqsEntry *pgqs_process_opexpr(OpExpr *expr, pgqsWalkerContext *context);
@@ -341,16 +241,16 @@ static Size pgqs_memsize(void);
 static Size pgqs_sampled_array_size(void);
 #endif
 
-
 /* Global Hash */
-static HTAB *pgqs_hash = NULL;
-static HTAB *pgqs_query_examples_hash = NULL;
-static pgqsSharedState *pgqs = NULL;
+HTAB *pgqs_hash = NULL;
+HTAB *pgqs_query_examples_hash = NULL;
+pgqsSharedState *pgqs = NULL;
+HTAB *pgqs_update_hash = NULL;
 
 /* Local Hash */
 static HTAB *pgqs_localhash = NULL;
 
-
+MemoryContext HypoMemoryContext;
 
 void
 _PG_init(void)
@@ -371,6 +271,8 @@ _PG_init(void)
 		shmem_startup_hook = pgqs_shmem_startup;
 	}
 
+	prev_planner_hook = planner_hook;
+	planner_hook = pgqs_planner;
 	prev_ExecutorStart = ExecutorStart_hook;
 	ExecutorStart_hook = pgqs_ExecutorStart;
 	prev_ExecutorRun = ExecutorRun_hook;
@@ -379,6 +281,10 @@ _PG_init(void)
 	ExecutorFinish_hook = pgqs_ExecutorFinish;
 	prev_ExecutorEnd = ExecutorEnd_hook;
 	ExecutorEnd_hook = pgqs_ExecutorEnd;
+	prev_get_relation_info_hook = get_relation_info_hook;
+	get_relation_info_hook = hypo_get_relation_info_hook;
+	prev_explain_get_index_name_hook = explain_get_index_name_hook;
+	explain_get_index_name_hook = hypo_explain_get_index_name_hook;
 
 	DefineCustomBoolVariable("pg_qualstats.enabled",
 							 "Enable / Disable pg_qualstats",
@@ -495,6 +401,10 @@ _PG_init(void)
 	}
 	else
 		pgqs_backend_mode_startup();
+
+	HypoMemoryContext = AllocSetContextCreate(TopMemoryContext,
+											  "HypoPG context",
+											  ALLOCSET_DEFAULT_SIZES);
 }
 
 
@@ -750,9 +660,9 @@ pgqs_ExecutorEnd(QueryDesc *queryDesc)
 			/* Lookup the hash table entry with a shared lock. */
 			PGQS_LWL_ACQUIRE(pgqs->querylock, LW_SHARED);
 
-			hash_search_with_hash_value(pgqs_query_examples_hash, &queryKey,
-										context->queryId,
-										HASH_FIND, &found);
+			queryEntry = (pgqsQueryStringEntry *) hash_search_with_hash_value(pgqs_query_examples_hash, &queryKey,
+																			  context->queryId,
+																			  HASH_FIND, &found);
 
 			/* Create the new entry if not present */
 			if (!found)

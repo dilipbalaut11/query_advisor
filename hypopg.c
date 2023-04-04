@@ -37,14 +37,11 @@
 #include "include/hypopg_import.h"
 #include "include/hypopg_index.h"
 
-PG_MODULE_MAGIC;
-
 /*--- Variables exported ---*/
 
-bool		isExplain;
-bool		hypo_is_enabled;
+bool		isExplain = true;
+bool		hypo_is_enabled = true;
 bool		hypo_use_real_oids;
-MemoryContext HypoMemoryContext;
 
 /*--- Private variables ---*/
 
@@ -54,111 +51,10 @@ static bool oid_wraparound = false;
 
 /*--- Functions --- */
 
-PGDLLEXPORT void _PG_init(void);
-
-PGDLLEXPORT Datum hypopg_reset(PG_FUNCTION_ARGS);
-
-PG_FUNCTION_INFO_V1(hypopg_reset);
-
-static void
-			hypo_utility_hook(
-#if PG_VERSION_NUM >= 100000
-							  PlannedStmt *pstmt,
-#else
-							  Node *parsetree,
-#endif
-							  const char *queryString,
-#if PG_VERSION_NUM >= 140000
-							  bool readOnlyTree,
-#endif
-#if PG_VERSION_NUM >= 90300
-							  ProcessUtilityContext context,
-#endif
-							  ParamListInfo params,
-#if PG_VERSION_NUM >= 100000
-							  QueryEnvironment *queryEnv,
-#endif
-#if PG_VERSION_NUM < 90300
-							  bool isTopLevel,
-#endif
-							  DestReceiver *dest,
-#if PG_VERSION_NUM < 130000
-							  char *completionTag
-#else
-							  QueryCompletion *qc
-#endif
-							  );
-static ProcessUtility_hook_type prev_utility_hook = NULL;
-
-static void hypo_executorEnd_hook(QueryDesc *queryDesc);
-static ExecutorEnd_hook_type prev_ExecutorEnd_hook = NULL;
-
-
 static Oid hypo_get_min_fake_oid(void);
-static void hypo_get_relation_info_hook(PlannerInfo *root,
-										Oid relationObjectId,
-										bool inhparent,
-										RelOptInfo *rel);
-static get_relation_info_hook_type prev_get_relation_info_hook = NULL;
+get_relation_info_hook_type prev_get_relation_info_hook = NULL;
 
 static bool hypo_index_match_table(hypoIndex *entry, Oid relid);
-static bool hypo_is_simple_explain(Node *node);
-
-void
-_PG_init(void)
-{
-	/* Install hooks */
-	prev_utility_hook = ProcessUtility_hook;
-	ProcessUtility_hook = hypo_utility_hook;
-
-	prev_ExecutorEnd_hook = ExecutorEnd_hook;
-	ExecutorEnd_hook = hypo_executorEnd_hook;
-
-	prev_get_relation_info_hook = get_relation_info_hook;
-	get_relation_info_hook = hypo_get_relation_info_hook;
-
-	prev_explain_get_index_name_hook = explain_get_index_name_hook;
-	explain_get_index_name_hook = hypo_explain_get_index_name_hook;
-
-	isExplain = false;
-	hypoIndexes = NIL;
-	hypoHiddenIndexes = NIL;
-
-	HypoMemoryContext = AllocSetContextCreate(TopMemoryContext,
-											  "HypoPG context",
-#if PG_VERSION_NUM >= 90600
-											  ALLOCSET_DEFAULT_SIZES
-#else
-											  ALLOCSET_DEFAULT_MINSIZE,
-											  ALLOCSET_DEFAULT_INITSIZE,
-											  ALLOCSET_DEFAULT_MAXSIZE
-#endif
-		);
-
-	DefineCustomBoolVariable("hypopg.enabled",
-							 "Enable / Disable hypopg",
-							 NULL,
-							 &hypo_is_enabled,
-							 true,
-							 PGC_USERSET,
-							 0,
-							 NULL,
-							 NULL,
-							 NULL);
-
-	DefineCustomBoolVariable("hypopg.use_real_oids",
-							 "Use real oids rather than the range < 16384",
-							 NULL,
-							 &hypo_use_real_oids,
-							 false,
-							 PGC_USERSET,
-							 0,
-							 NULL,
-							 NULL,
-							 NULL);
-
-	EmitWarningsOnPlaceholders("hypopg");
-}
 
 /*---------------------------------
  * Return a new OID for an hypothetical index.
@@ -272,105 +168,6 @@ hypo_reset_fake_oids(void)
 	oid_wraparound = false;
 }
 
-/* This function setup the "isExplain" flag for next hooks.
- * If this flag is setup, we can add hypothetical indexes.
- */
-void
-hypo_utility_hook(
-#if PG_VERSION_NUM >= 100000
-				  PlannedStmt *pstmt,
-#else
-				  Node *parsetree,
-#endif
-				  const char *queryString,
-#if PG_VERSION_NUM >= 140000
-				  bool readOnlyTree,
-#endif
-#if PG_VERSION_NUM >= 90300
-				  ProcessUtilityContext context,
-#endif
-				  ParamListInfo params,
-#if PG_VERSION_NUM >= 100000
-				  QueryEnvironment *queryEnv,
-#endif
-#if PG_VERSION_NUM < 90300
-				  bool isTopLevel,
-#endif
-				  DestReceiver *dest,
-#if PG_VERSION_NUM < 130000
-				  char *completionTag
-#else
-				  QueryCompletion *qc
-#endif
-				  )
-{
-	isExplain = hypo_is_simple_explain(
-#if PG_VERSION_NUM >= 100000
-									   (Node *) pstmt
-#else
-									   parsetree
-#endif
-									   );
-
-	if (prev_utility_hook)
-		prev_utility_hook(
-#if PG_VERSION_NUM >= 100000
-						  pstmt,
-#else
-						  parsetree,
-#endif
-						  queryString,
-#if PG_VERSION_NUM >= 140000
-						  readOnlyTree,
-#endif
-#if PG_VERSION_NUM >= 90300
-						  context,
-#endif
-						  params,
-#if PG_VERSION_NUM >= 100000
-						  queryEnv,
-#endif
-#if PG_VERSION_NUM < 90300
-						  isTopLevel,
-#endif
-						  dest,
-#if PG_VERSION_NUM < 130000
-						  completionTag
-#else
-						  qc
-#endif
-						  );
-	else
-		standard_ProcessUtility(
-#if PG_VERSION_NUM >= 100000
-								pstmt,
-#else
-								parsetree,
-#endif
-								queryString,
-#if PG_VERSION_NUM >= 140000
-								readOnlyTree,
-#endif
-#if PG_VERSION_NUM >= 90300
-								context,
-#endif
-								params,
-#if PG_VERSION_NUM >= 100000
-								queryEnv,
-#endif
-#if PG_VERSION_NUM < 90300
-								isTopLevel,
-#endif
-								dest,
-#if PG_VERSION_NUM < 130000
-						  completionTag
-#else
-						  qc
-#endif
-						  );
-
-}
-
 static bool
 hypo_index_match_table(hypoIndex *entry, Oid relid)
 {
@@ -398,56 +195,6 @@ hypo_index_match_table(hypoIndex *entry, Oid relid)
 #endif
 
 	return false;
-}
-
-/* Detect if the current utility command is compatible with hypothetical indexes
- * i.e. an EXPLAIN, no ANALYZE
- */
-static bool
-hypo_is_simple_explain(Node *parsetree)
-{
-	if (parsetree == NULL)
-		return false;
-
-#if PG_VERSION_NUM >= 100000
-	parsetree = ((PlannedStmt *) parsetree)->utilityStmt;
-	if (parsetree == NULL)
-		return false;
-#endif
-
-	switch (nodeTag(parsetree))
-	{
-		case T_ExplainStmt:
-			{
-				ListCell   *lc;
-
-				foreach(lc, ((ExplainStmt *) parsetree)->options)
-				{
-					DefElem    *opt = (DefElem *) lfirst(lc);
-
-					if (strcmp(opt->defname, "analyze") == 0)
-						return false;
-				}
-			}
-			return true;
-			break;
-		default:
-			return false;
-	}
-	return false;
-}
-
-
-/* Reset the isExplain flag after each query */
-static void
-hypo_executorEnd_hook(QueryDesc *queryDesc)
-{
-	isExplain = false;
-
-	if (prev_ExecutorEnd_hook)
-		prev_ExecutorEnd_hook(queryDesc);
-	else
-		standard_ExecutorEnd(queryDesc);
 }
 
 /*
@@ -494,7 +241,7 @@ hypo_get_min_fake_oid(void)
  * This function will execute the "hypo_injectHypotheticalIndex" for every
  * hypothetical index found for each relation if the isExplain flag is setup.
  */
-static void
+void
 hypo_get_relation_info_hook(PlannerInfo *root,
 							Oid relationObjectId,
 							bool inhparent,
@@ -529,8 +276,6 @@ hypo_get_relation_info_hook(PlannerInfo *root,
 												 inhparent, rel, relation, entry);
 				}
 			}
-
-			hypo_hideIndexes(rel);
 		}
 
 		/* Close the relation release the lock now */
@@ -541,12 +286,3 @@ hypo_get_relation_info_hook(PlannerInfo *root,
 		prev_get_relation_info_hook(root, relationObjectId, inhparent, rel);
 }
 
-/*
- * Reset statistics.
- */
-PGDLLEXPORT Datum
-hypopg_reset(PG_FUNCTION_ARGS)
-{
-	hypo_index_reset();
-	PG_RETURN_VOID();
-}
