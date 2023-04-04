@@ -23,9 +23,19 @@
 #include "optimizer/plancat.h"
 #include "utils/memutils.h"
 
+extern bool pgqs_backend;
+
 /* Since cff440d368, queryid becomes a uint64 internally. */
 
 #define PGQS_CONSTANT_SIZE 80	/* Truncate constant representation at 80 */
+
+#define PGQS_LWL_ACQUIRE(lock, mode) if (!pgqs_backend) { \
+	LWLockAcquire(lock, mode); \
+	}
+
+#define PGQS_LWL_RELEASE(lock) if (!pgqs_backend) { \
+	LWLockRelease(lock); \
+	}
 
 #if PG_VERSION_NUM >= 110000
 typedef uint64 pgqs_queryid;
