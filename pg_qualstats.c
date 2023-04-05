@@ -20,7 +20,7 @@
  * The implementation is heavily inspired by pg_stat_statements
  *
  * Copyright (c) 2014,2017 Ronan Dunklau
- * Copyright (c) 2018-2023, The Powa-Team
+ * Copyright (c) 2018-2022, The Powa-Team
  *-------------------------------------------------------------------------
  */
 #include <limits.h>
@@ -76,6 +76,10 @@
 #include "utils/memutils.h"
 #include "utils/tuplestore.h"
 
+#include "include/hypopg.h"
+#include "include/hypopg_index.h"
+#include "include/pg_qualstats.h"
+
 PG_MODULE_MAGIC;
 
 #define PGQS_NAME_COLUMNS 7		/* number of column added when using
@@ -85,20 +89,11 @@ PG_MODULE_MAGIC;
 #define PGQS_MAX_LOCAL_ENTRIES	(pgqs_max * 0.2)	/* do not track more of
 													 * 20% of possible entries
 													 * in shared mem */
-#define PGQS_CONSTANT_SIZE 80	/* Truncate constant representation at 80 */
 
 #define PGQS_FLAGS (INSTRUMENT_ROWS|INSTRUMENT_BUFFERS)
 
 #define PGQS_RATIO	0
 #define PGQS_NUM	1
-
-#define PGQS_LWL_ACQUIRE(lock, mode) if (!pgqs_backend) { \
-	LWLockAcquire(lock, mode); \
-	}
-
-#define PGQS_LWL_RELEASE(lock) if (!pgqs_backend) { \
-	LWLockRelease(lock); \
-	}
 
 #if PG_VERSION_NUM < 140000
 #define ParallelLeaderBackendId ParallelMasterBackendId
@@ -124,7 +119,6 @@ extern PGDLLEXPORT Datum pg_qualstats_names(PG_FUNCTION_ARGS);
 extern PGDLLEXPORT Datum pg_qualstats_names_2_0(PG_FUNCTION_ARGS);
 static Datum pg_qualstats_common(PG_FUNCTION_ARGS, pgqsVersion api_version,
 								 bool include_names);
-extern PGDLLEXPORT Datum pg_qualstats_example_query(PG_FUNCTION_ARGS);
 extern PGDLLEXPORT Datum pg_qualstats_example_queries(PG_FUNCTION_ARGS);
 
 PG_FUNCTION_INFO_V1(pg_qualstats_reset);
@@ -132,7 +126,6 @@ PG_FUNCTION_INFO_V1(pg_qualstats);
 PG_FUNCTION_INFO_V1(pg_qualstats_2_0);
 PG_FUNCTION_INFO_V1(pg_qualstats_names);
 PG_FUNCTION_INFO_V1(pg_qualstats_names_2_0);
-PG_FUNCTION_INFO_V1(pg_qualstats_example_query);
 PG_FUNCTION_INFO_V1(pg_qualstats_example_queries);
 
 static void pgqs_backend_mode_startup(void);
@@ -170,13 +163,13 @@ static uint32 pgqs_hash_fn(const void *key, Size keysize);
 static uint32 pgqs_uint32_hashfn(const void *key, Size keysize);
 #endif
 
-static bool pgqs_backend = false;
+bool pgqs_backend = false;
 static int	pgqs_query_size;
 static int	pgqs_max = PGQS_MAX_DEFAULT;			/* max # statements to track */
 static bool pgqs_track_pgcatalog;	/* track queries on pg_catalog */
 static bool pgqs_resolve_oids;	/* resolve oids */
 static bool pgqs_enabled;
-static bool pgqs_track_constants;
+static bool pgqs_track_constants = true;
 static double pgqs_sample_rate;
 static int	pgqs_min_err_ratio;
 static int	pgqs_min_err_num;
@@ -188,28 +181,6 @@ static void pgqs_set_query_sampled(bool sample);
 #endif
 static bool pgqs_is_query_sampled(void);
 
-
-/*---- Data structures declarations ----*/
-typedef struct pgqsSharedState
-{
-#if PG_VERSION_NUM >= 90400
-	LWLock	   *lock;			/* protects counters hashtable
-								 * search/modification */
-	LWLock	   *querylock;		/* protects query hashtable
-								 * search/modification */
-#else
-	LWLockId	lock;			/* protects counters hashtable
-								 * search/modification */
-	LWLockId	querylock;		/* protects query hashtable
-								 * search/modification */
-#endif
-#if PG_VERSION_NUM >= 90600
-	LWLock	   *sampledlock;	/* protects sampled array search/modification */
-	bool		sampled[FLEXIBLE_ARRAY_MEMBER]; /* should we sample this
-												 * query? */
-#endif
-} pgqsSharedState;
-
 /* Since cff440d368, queryid becomes a uint64 internally. */
 
 #if PG_VERSION_NUM >= 110000
@@ -217,78 +188,6 @@ typedef uint64 pgqs_queryid;
 #else
 typedef uint32 pgqs_queryid;
 #endif
-
-typedef struct pgqsHashKey
-{
-	Oid			userid;			/* user OID */
-	Oid			dbid;			/* database OID */
-	pgqs_queryid queryid;		/* query identifier (if set by another plugin */
-	uint32		uniquequalnodeid;	/* Hash of the const */
-	uint32		uniquequalid;	/* Hash of the parent, including the consts */
-	char		evaltype;		/* Evaluation type. Can be 'f' to mean a qual
-								 * executed after a scan, or 'i' for an
-								 * indexqual */
-} pgqsHashKey;
-
-typedef struct pgqsNames
-{
-	NameData	rolname;
-	NameData	datname;
-	NameData	lrelname;
-	NameData	lattname;
-	NameData	opname;
-	NameData	rrelname;
-	NameData	rattname;
-} pgqsNames;
-
-typedef struct pgqsEntry
-{
-	pgqsHashKey key;
-	Oid			lrelid;			/* LHS relation OID or NULL if not var */
-	AttrNumber	lattnum;		/* LHS attribute Number or NULL if not var */
-	Oid			opoid;			/* Operator OID */
-	Oid			rrelid;			/* RHS relation OID or NULL if not var */
-	AttrNumber	rattnum;		/* RHS attribute Number or NULL if not var */
-	char		constvalue[PGQS_CONSTANT_SIZE]; /* Textual representation of
-												 * the right hand constant, if
-												 * any */
-	uint32		qualid;			/* Hash of the parent AND expression if any, 0
-								 * otherwise. */
-	uint32		qualnodeid;		/* Hash of the node itself */
-
-	int64		count;			/* # of operator execution */
-	int64		nbfiltered;		/* # of lines discarded by the operator */
-	int			position;		/* content position in query text */
-	double		usage;			/* # of qual execution, used for deallocation */
-	double		min_err_estim[2];	/* min estimation error ratio and num */
-	double		max_err_estim[2];	/* max estimation error ratio and num */
-	double		mean_err_estim[2];	/* mean estimation error ratio and num */
-	double		sum_err_estim[2];	/* sum of variances in estimation error
-									 * ratio and num */
-	int64		occurences;		/* # of qual execution, 1 per query */
-} pgqsEntry;
-
-typedef struct pgqsEntryWithNames
-{
-	pgqsEntry	entry;
-	pgqsNames	names;
-} pgqsEntryWithNames;
-
-typedef struct pgqsQueryStringHashKey
-{
-	pgqs_queryid queryid;
-} pgqsQueryStringHashKey;
-
-typedef struct pgqsQueryStringEntry
-{
-	pgqsQueryStringHashKey key;
-
-	/*
-	 * Imperatively at the end of the struct This is actually of length
-	 * query_size, which is track_activity_query_size
-	 */
-	char		querytext[1];
-} pgqsQueryStringEntry;
 
 /*
  * Transient state of the query tree walker - for the meaning of the counters,
@@ -328,11 +227,9 @@ static void pgqs_set_planstates(PlanState *planstate, pgqsWalkerContext *context
 static Expr *pgqs_resolve_var(Var *var, pgqsWalkerContext *context);
 
 
-static void pgqs_entry_dealloc(void);
 static inline void pgqs_entry_init(pgqsEntry *entry);
 static inline void pgqs_entry_copy_raw(pgqsEntry *dest, pgqsEntry *src);
 static void pgqs_entry_err_estim(pgqsEntry *e, double *err_estim, int64 occurences);
-static void pgqs_queryentry_dealloc(void);
 static void pgqs_localentry_dealloc(int nvictims);
 static void pgqs_fillnames(pgqsEntryWithNames *entry);
 
@@ -341,16 +238,13 @@ static Size pgqs_memsize(void);
 static Size pgqs_sampled_array_size(void);
 #endif
 
-
 /* Global Hash */
-static HTAB *pgqs_hash = NULL;
-static HTAB *pgqs_query_examples_hash = NULL;
-static pgqsSharedState *pgqs = NULL;
+HTAB *pgqs_hash = NULL;
+HTAB *pgqs_query_examples_hash = NULL;
+pgqsSharedState *pgqs = NULL;
 
-/* Local Hash */
+MemoryContext HypoMemoryContext;
 static HTAB *pgqs_localhash = NULL;
-
-
 
 void
 _PG_init(void)
@@ -379,8 +273,12 @@ _PG_init(void)
 	ExecutorFinish_hook = pgqs_ExecutorFinish;
 	prev_ExecutorEnd = ExecutorEnd_hook;
 	ExecutorEnd_hook = pgqs_ExecutorEnd;
+	prev_get_relation_info_hook = get_relation_info_hook;
+	get_relation_info_hook = hypo_get_relation_info_hook;
+	prev_explain_get_index_name_hook = explain_get_index_name_hook;
+	explain_get_index_name_hook = hypo_explain_get_index_name_hook;
 
-	DefineCustomBoolVariable("pg_qualstats.enabled",
+	DefineCustomBoolVariable("query_advisor.enabled",
 							 "Enable / Disable pg_qualstats",
 							 NULL,
 							 &pgqs_enabled,
@@ -391,19 +289,8 @@ _PG_init(void)
 							 NULL,
 							 NULL);
 
-	DefineCustomBoolVariable("pg_qualstats.track_constants",
-							 "Enable / Disable pg_qualstats constants tracking",
-							 NULL,
-							 &pgqs_track_constants,
-							 true,
-							 PGC_USERSET,
-							 0,
-							 NULL,
-							 NULL,
-							 NULL);
-
-	DefineCustomIntVariable("pg_qualstats.max",
-							"Sets the maximum number of statements tracked by pg_qualstats.",
+	DefineCustomIntVariable("query_advisor.max",
+							"Sets the maximum number of statements tracked by query_advisor.",
 							NULL,
 							&pgqs_max,
 							PGQS_MAX_DEFAULT,
@@ -415,30 +302,7 @@ _PG_init(void)
 							NULL,
 							NULL);
 
-	if (!pgqs_backend)
-		DefineCustomBoolVariable("pg_qualstats.resolve_oids",
-								 "Store names alongside the oid. Eats MUCH more space!",
-								 NULL,
-								 &pgqs_resolve_oids,
-								 false,
-								 PGC_POSTMASTER,
-								 0,
-								 NULL,
-								 NULL,
-								 NULL);
-
-	DefineCustomBoolVariable("pg_qualstats.track_pg_catalog",
-							 "Track quals on system catalogs too.",
-							 NULL,
-							 &pgqs_track_pgcatalog,
-							 false,
-							 PGC_USERSET,
-							 0,
-							 NULL,
-							 NULL,
-							 NULL);
-
-	DefineCustomRealVariable("pg_qualstats.sample_rate",
+	DefineCustomRealVariable("query_advisor.sample_rate",
 							 "Sampling rate. 1 means every query, 0.2 means 1 in five queries",
 							 NULL,
 							 &pgqs_sample_rate,
@@ -451,7 +315,7 @@ _PG_init(void)
 							 NULL,
 							 NULL);
 
-	DefineCustomIntVariable("pg_qualstats.min_err_estimate_ratio",
+	DefineCustomIntVariable("query_advisor.min_err_estimate_ratio",
 							"Error estimation ratio threshold to save quals",
 							NULL,
 							&pgqs_min_err_ratio,
@@ -464,7 +328,7 @@ _PG_init(void)
 							NULL,
 							NULL);
 
-	DefineCustomIntVariable("pg_qualstats.min_err_estimate_num",
+	DefineCustomIntVariable("query_advisor.min_err_estimate_num",
 							"Error estimation num threshold to save quals",
 							NULL,
 							&pgqs_min_err_num,
@@ -477,7 +341,7 @@ _PG_init(void)
 							NULL,
 							NULL);
 
-	EmitWarningsOnPlaceholders("pg_qualstats");
+	EmitWarningsOnPlaceholders("query_advisor");
 
 	parse_int(GetConfigOption("track_activity_query_size", false, false),
 			  &pgqs_query_size, 0, NULL);
@@ -495,6 +359,10 @@ _PG_init(void)
 	}
 	else
 		pgqs_backend_mode_startup();
+
+	HypoMemoryContext = AllocSetContextCreate(TopMemoryContext,
+											  "HypoPG context",
+											  ALLOCSET_DEFAULT_SIZES);
 }
 
 
@@ -764,8 +632,16 @@ pgqs_ExecutorEnd(QueryDesc *queryDesc)
 				PGQS_LWL_RELEASE(pgqs->querylock);
 				PGQS_LWL_ACQUIRE(pgqs->querylock, LW_EXCLUSIVE);
 
-				while (hash_get_num_entries(pgqs_query_examples_hash) >= pgqs_max)
-					pgqs_queryentry_dealloc();
+				if (hash_get_num_entries(pgqs_query_examples_hash) >= pgqs_max)
+				{
+					ereport(WARNING,
+							(errcode(ERRCODE_OUT_OF_MEMORY),
+							errmsg("workload hash table is full so current query is skipped"),
+							errhint("reset the stats or increase value of pgqs_max and restart")));
+					PGQS_LWL_RELEASE(pgqs->querylock);
+
+					goto cleanup;
+				}
 
 				queryEntry = (pgqsQueryStringEntry *) hash_search_with_hash_value(pgqs_query_examples_hash, &queryKey,
 																				  context->queryId,
@@ -819,9 +695,17 @@ pgqs_ExecutorEnd(QueryDesc *queryDesc)
 
 			PGQS_LWL_ACQUIRE(pgqs->lock, LW_EXCLUSIVE);
 
-			while (hash_get_num_entries(pgqs_hash) +
-				   hash_get_num_entries(pgqs_localhash) >= pgqs_max)
-				pgqs_entry_dealloc();
+			if (hash_get_num_entries(pgqs_hash) +
+				hash_get_num_entries(pgqs_localhash) >= pgqs_max)
+			{
+				ereport(WARNING,
+						(errcode(ERRCODE_OUT_OF_MEMORY),
+						 errmsg("qual hash table is full so current quals are skipped"),
+						 errhint("reset the stats or increase value of pgqs_max and restart")));
+				PGQS_LWL_RELEASE(pgqs->lock);
+
+				goto cleanup;
+			}
 
 			hash_seq_init(&local_hash_seq, pgqs_localhash);
 			while ((localentry = hash_seq_search(&local_hash_seq)) != NULL)
@@ -853,72 +737,11 @@ pgqs_ExecutorEnd(QueryDesc *queryDesc)
 		}
 	}
 
+cleanup:
 	if (prev_ExecutorEnd)
 		prev_ExecutorEnd(queryDesc);
 	else
 		standard_ExecutorEnd(queryDesc);
-}
-
-/*
- * qsort comparator for sorting into increasing usage order
- */
-static int
-entry_cmp(const void *lhs, const void *rhs)
-{
-	double		l_usage = (*(pgqsEntry *const *) lhs)->usage;
-	double		r_usage = (*(pgqsEntry *const *) rhs)->usage;
-
-	if (l_usage < r_usage)
-		return -1;
-	else if (l_usage > r_usage)
-		return +1;
-	else
-		return 0;
-}
-
-/*
- * Deallocate least used entries.
- * Caller must hold an exlusive lock on pgqs->lock
- */
-static void
-pgqs_entry_dealloc(void)
-{
-	HASH_SEQ_STATUS hash_seq;
-	pgqsEntry **entries;
-	pgqsEntry  *entry;
-	int			nvictims;
-	int			i;
-	int			base_size;
-
-	/*
-	 * Sort entries by usage and deallocate PGQS_USAGE_DEALLOC_PERCENT of
-	 * them. While we're scanning the table, apply the decay factor to the
-	 * usage values.
-	 * pgqs_resolve_oids is irrelevant here as the array stores pointers
-	 * instead of entries. The struct member used for the sort are part of
-	 * pgqsEntry.
-	 */
-	base_size = sizeof(pgqsEntry *);
-
-	entries = palloc(hash_get_num_entries(pgqs_hash) * base_size);
-
-	i = 0;
-	hash_seq_init(&hash_seq, pgqs_hash);
-	while ((entry = hash_seq_search(&hash_seq)) != NULL)
-	{
-		entries[i++] = entry;
-		entry->usage *= 0.99;
-	}
-
-	qsort(entries, i, base_size, entry_cmp);
-
-	nvictims = Max(10, i * PGQS_USAGE_DEALLOC_PERCENT / 100);
-	nvictims = Min(nvictims, i);
-
-	for (i = 0; i < nvictims; i++)
-		hash_search(pgqs_hash, &entries[i]->key, HASH_REMOVE, NULL);
-
-	pfree(entries);
 }
 
 /* Initialize all non-key fields of the given entry. */
@@ -974,27 +797,6 @@ pgqs_entry_err_estim(pgqsEntry *e, double *err_estim, int64 occurences)
 			e->min_err_estim[i] = err_estim[i];
 		if (e->max_err_estim[i] < err_estim[i])
 			e->max_err_estim[i] = err_estim[i];
-	}
-}
-
-/*
- * Deallocate the first example query.
- * Caller must hold an exlusive lock on pgqs->querylock
- */
-static void
-pgqs_queryentry_dealloc(void)
-{
-	HASH_SEQ_STATUS hash_seq;
-	pgqsQueryStringEntry *entry;
-
-	hash_seq_init(&hash_seq, pgqs_query_examples_hash);
-	entry = hash_seq_search(&hash_seq);
-
-	if (entry != NULL)
-	{
-		hash_search_with_hash_value(pgqs_query_examples_hash, &entry->key,
-									entry->key.queryid, HASH_REMOVE, NULL);
-		hash_seq_term(&hash_seq);
 	}
 }
 
@@ -1955,24 +1757,6 @@ pg_qualstats_2_0(PG_FUNCTION_ARGS)
 }
 
 Datum
-pg_qualstats_names_2_0(PG_FUNCTION_ARGS)
-{
-	return pg_qualstats_common(fcinfo, PGQS_V2_0, true);
-}
-
-Datum
-pg_qualstats(PG_FUNCTION_ARGS)
-{
-	return pg_qualstats_common(fcinfo, PGQS_V1_0, false);
-}
-
-Datum
-pg_qualstats_names(PG_FUNCTION_ARGS)
-{
-	return pg_qualstats_common(fcinfo, PGQS_V1_0, true);
-}
-
-Datum
 pg_qualstats_common(PG_FUNCTION_ARGS, pgqsVersion api_version,
 					bool include_names)
 {
@@ -2199,40 +1983,6 @@ pg_qualstats_common(PG_FUNCTION_ARGS, pgqsVersion api_version,
 	MemoryContextSwitchTo(oldcontext);
 
 	return (Datum) 0;
-}
-
-Datum
-pg_qualstats_example_query(PG_FUNCTION_ARGS)
-{
-#if PG_VERSION_NUM >= 110000
-	pgqs_queryid queryid = PG_GETARG_INT64(0);
-#else
-	pgqs_queryid queryid = PG_GETARG_UINT32(0);
-#endif
-	pgqsQueryStringEntry *entry;
-	pgqsQueryStringHashKey queryKey;
-	bool		found;
-
-	if ((!pgqs && !pgqs_backend) || !pgqs_hash)
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("pg_qualstats must be loaded via shared_preload_libraries")));
-
-	/* don't search the hash table if track_constants isn't enabled */
-	if (!pgqs_track_constants)
-		PG_RETURN_NULL();
-
-	queryKey.queryid = queryid;
-
-	PGQS_LWL_ACQUIRE(pgqs->querylock, LW_SHARED);
-	entry = hash_search_with_hash_value(pgqs_query_examples_hash, &queryKey,
-										queryid, HASH_FIND, &found);
-	PGQS_LWL_RELEASE(pgqs->querylock);
-
-	if (found)
-		PG_RETURN_TEXT_P(cstring_to_text(entry->querytext));
-	else
-		PG_RETURN_NULL();
 }
 
 Datum
