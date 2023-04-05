@@ -30,8 +30,10 @@
 extern PGDLLEXPORT Datum query_advisor_index_recommendations(PG_FUNCTION_ARGS);
 PG_FUNCTION_INFO_V1(query_advisor_index_recommendations);
 
-/* define this to enable the developer level debugging informations */
-//#define DEBUG_INDEX_ADVISOR
+/*
+ *define this to enable the developer level debugging informations
+ * #define DEBUG_INDEX_ADVISOR
+ */
 
 /*
  * If 'qa_disable_stats' is set to indicate the pg_qualstats's executor
@@ -1108,6 +1110,12 @@ qa_set_basecost(QueryInfo *queryinfos, int nqueries)
 		total_cost += qa_plan_cost;
 	}
 
+	/*
+	 * The 'qa_plan_query' will perform query planning under a subtransaction,
+	 * so that if it encounter any failure it can revert only that
+	 * subtransaction.  So if end of all the work done if we have a
+	 * subtransaction open then release that.
+	 */
 	if (have_internal_subtxn)
 	{
 		ReleaseCurrentSubTransaction();
@@ -1147,10 +1155,23 @@ qa_plan_query(const char *query)
 }
 #endif
 
+/*
+ * Plan a query stored in queryinfo and store the total cost in qa_plan_cost.
+ * The planning will be performed under a sub-transaction so that if there
+ * any change in definition or any object is missing we can ignore the failure
+ * and mark the query as failed so that we can avoid any future failure.
+ *
+ * If the caller is planning multiple queries in loop then we are not starting
+ * a subtransaction for each query, instead we remember whether the
+ * subtransaction is already started or not in 'have_internal_subtxn'.  So it's
+ * caller's responsibility to release the subtransaction if the flag is set
+ * once it has done planning all the queries.
+ */
 static bool
 qa_plan_query(QueryInfo *queryinfo, bool *have_internal_subtxn,
 			  MemoryContext oldcontext, ResourceOwner oldowner)
 {
+	/* start a subtransaction if one is not already running */
 	if (!(*have_internal_subtxn))
 	{
 		BeginInternalSubTransaction(NULL);
@@ -1164,7 +1185,9 @@ qa_plan_query(QueryInfo *queryinfo, bool *have_internal_subtxn,
 		int		numparam = 0;
 		List   *parseTreeList = NULL;
 		Node   *parseTreeNode;
+#if PG_VERSION_NUM >= 140000		
 		List   *queryTreeList = NULL;
+#endif		
 		Query  *query;
 		char   *querytext = queryinfo->query;
 		PlannedStmt *plan;
@@ -1182,9 +1205,10 @@ qa_plan_query(QueryInfo *queryinfo, bool *have_internal_subtxn,
 #if PG_VERSION_NUM >= 150000
 										, NULL
 #endif
-//#ifdef EDB_MINORVERSION_NUM
-//										, NULL, NULL
-//#endif
+
+#ifdef EDB_ADVANCED_SERVER
+										, NULL, NULL
+#endif
 										);
 
 #if PG_VERSION_NUM >= 140000
@@ -1195,19 +1219,17 @@ qa_plan_query(QueryInfo *queryinfo, bool *have_internal_subtxn,
 
 		query = (Query *) linitial(queryTreeList);
 #endif
-		hypo_is_enabled = true;
 		plan = pg_plan_query(query,
 #if PG_VERSION_NUM >= 130000
 							 querytext,
 #endif
 							 0,
 							 NULL);
-		hypo_is_enabled = false;
 		qa_plan_cost = plan->planTree->total_cost;
 	}
 	PG_CATCH();
 	{
-		/* Abort the inner transaction */
+		/* flush error state and abort the inner transaction */
 		FlushErrorState();
 		RollbackAndReleaseCurrentSubTransaction();
 		MemoryContextSwitchTo(oldcontext);
@@ -1297,6 +1319,9 @@ qa_compute_index_benefit(IndexAdvisorContext *context,
 		if (cand->overhead == 0)
 			cand->overhead = qa_get_index_overhead(cand, relpages);
 
+		/* enable considering hypothetical indexes before start planning */
+		hypo_is_enabled = true;
+
 		/* replan each query and update benefit matrix */
 		for (j = 0; j < nqueries; j++)
 		{
@@ -1324,7 +1349,14 @@ qa_compute_index_benefit(IndexAdvisorContext *context,
 			else
 				benefit[qidx][i] = 0;
 		}
+		hypo_is_enabled = false;
 
+		/*
+		 * The 'qa_plan_query' will perform query planning under a subtransaction,
+		 * so that if it encounter any failure it can revert only that
+		 * subtransaction.  So if end of all the work done if we have a
+		 * subtransaction open then release that.
+		 */
 		if (have_internal_subtxn)
 		{
 			ReleaseCurrentSubTransaction();
