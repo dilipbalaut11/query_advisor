@@ -116,6 +116,15 @@ RETURNS SETOF record
 AS 'MODULE_PATHNAME', 'pg_qualstats_2_0'
 LANGUAGE C STRICT VOLATILE;
 
+/*"""
+.. function query_advisor_qualstats_memory_usage()
+
+*/
+CREATE FUNCTION query_advisor_qualstats_memory_usage(OUT storage_name text, OUT usage_percentages float4)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME', 'pg_qualstats_status'
+LANGUAGE C;
+
 -- Register a view on the function for ease of use.
 /*"""
 .. view:: query_advisor_qualstats
