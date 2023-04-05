@@ -8,6 +8,7 @@ PG_CONFIG    ?= pg_config
 
 MODULE_big = query_advisor
 OBJS = pg_qualstats.o \
+       query_advisor.o \
        hypopg.o \
        hypopg_index.o \
        import/hypopg_import.o \

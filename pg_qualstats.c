@@ -25,6 +25,7 @@
  */
 #include <limits.h>
 #include <math.h>
+#include "c.h"
 #include "postgres.h"
 #include "access/hash.h"
 #include "access/htup_details.h"
@@ -45,6 +46,7 @@
 #if PG_VERSION_NUM >= 150000
 #include "common/pg_prng.h"
 #endif
+#include "executor/spi.h"
 #include "fmgr.h"
 #include "funcapi.h"
 #include "mb/pg_wchar.h"
@@ -54,6 +56,7 @@
 #include "nodes/makefuncs.h"
 #include "optimizer/clauses.h"
 #include "optimizer/planner.h"
+#include "optimizer/optimizer.h"
 #include "parser/analyze.h"
 #include "parser/parse_node.h"
 #include "parser/parsetree.h"
@@ -76,6 +79,7 @@
 #include "utils/memutils.h"
 #include "utils/tuplestore.h"
 
+#include "include/query_advisor.h"
 #include "include/hypopg.h"
 #include "include/hypopg_index.h"
 #include "include/pg_qualstats.h"
@@ -121,6 +125,7 @@ extern PGDLLEXPORT Datum pg_qualstats_names_2_0(PG_FUNCTION_ARGS);
 static Datum pg_qualstats_common(PG_FUNCTION_ARGS, pgqsVersion api_version,
 								 bool include_names);
 extern PGDLLEXPORT Datum pg_qualstats_example_queries(PG_FUNCTION_ARGS);
+extern PGDLLEXPORT Datum pg_qualstats_generate_advise(PG_FUNCTION_ARGS);
 
 PG_FUNCTION_INFO_V1(pg_qualstats_reset);
 PG_FUNCTION_INFO_V1(pg_qualstats);
@@ -150,10 +155,26 @@ static void pgqs_ExecutorRun(QueryDesc *queryDesc,
 static void pgqs_ExecutorFinish(QueryDesc *queryDesc);
 static void pgqs_ExecutorEnd(QueryDesc *queryDesc);
 
+static void pgqs_ProcessUtility(PlannedStmt *pstmt,
+								const char *queryString,
+#if PG_VERSION_NUM >= 140000
+								bool readOnlyTree,
+#endif
+								ProcessUtilityContext context,
+								ParamListInfo params,
+								QueryEnvironment *queryEnv,
+								DestReceiver *dest,
+#if PG_VERSION_NUM < 130000
+								char *completionTag
+#else
+								QueryCompletion *qc
+#endif
+								);
 static ExecutorStart_hook_type prev_ExecutorStart = NULL;
 static ExecutorRun_hook_type prev_ExecutorRun = NULL;
 static ExecutorFinish_hook_type prev_ExecutorFinish = NULL;
 static ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
+static ProcessUtility_hook_type prev_ProcessUtility = NULL;
 #if PG_VERSION_NUM >= 150000
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
 #endif
@@ -175,6 +196,7 @@ static int	pgqs_max_update = PGQS_MAX_DEFAULT;		/* max # statements to track */
 static bool pgqs_track_pgcatalog = false;	/* track queries on pg_catalog */
 static bool pgqs_resolve_oids = false;	/* resolve oids */
 static bool pgqs_enabled;
+static bool	is_utility = false;
 static bool pgqs_track_constants = true;
 static double pgqs_sample_rate;
 static int	pgqs_min_err_ratio;
@@ -224,6 +246,7 @@ static void pgqs_set_planstates(PlanState *planstate, pgqsWalkerContext *context
 static Expr *pgqs_resolve_var(Var *var, pgqsWalkerContext *context);
 static void pgqsInsertOverheadHash(ModifyTable *node, pgqsWalkerContext *context);
 
+
 static inline void pgqs_entry_init(pgqsEntry *entry);
 static inline void pgqs_entry_copy_raw(pgqsEntry *dest, pgqsEntry *src);
 static void pgqs_entry_err_estim(pgqsEntry *e, double *err_estim, int64 occurences);
@@ -245,6 +268,7 @@ HTAB *pgqs_update_hash = NULL;
 static HTAB *pgqs_localhash = NULL;
 
 MemoryContext HypoMemoryContext;
+
 
 void
 _PG_init(void)
@@ -278,6 +302,8 @@ _PG_init(void)
 	ExecutorFinish_hook = pgqs_ExecutorFinish;
 	prev_ExecutorEnd = ExecutorEnd_hook;
 	ExecutorEnd_hook = pgqs_ExecutorEnd;
+	prev_ProcessUtility = ProcessUtility_hook;
+	ProcessUtility_hook = pgqs_ProcessUtility;
 	prev_get_relation_info_hook = get_relation_info_hook;
 	get_relation_info_hook = hypo_get_relation_info_hook;
 	prev_explain_get_index_name_hook = explain_get_index_name_hook;
@@ -332,6 +358,7 @@ _PG_init(void)
 							NULL,
 							NULL,
 							NULL);
+
 
 	DefineCustomRealVariable("query_advisor.sample_rate",
 							 "Sampling rate. 1 means every query, 0.2 means 1 in five queries",
@@ -502,7 +529,8 @@ static void
 pgqs_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
 	/* Setup instrumentation */
-	if (pgqs_enabled)
+	if (pgqs_enabled  && strlen(queryDesc->sourceText) < pgqs_query_size &&
+		!qa_disable_stats && !is_utility)
 	{
 		/*
 		 * For rate sampling, randomly choose top-level statement. Either all
@@ -606,7 +634,7 @@ pgqs_ExecutorFinish(QueryDesc *queryDesc)
  * utility statements.
  */
 static uint64
-pgqs_hash_string(const char *str, int len)
+pgss_hash_string(const char *str, int len)
 {
 	return DatumGetUInt64(hash_any_extended((const unsigned char *) str,
 											len, 0));
@@ -622,7 +650,8 @@ pgqs_ExecutorEnd(QueryDesc *queryDesc)
 	pgqsQueryStringHashKey queryKey;
 	bool		found;
 
-	if ((pgqs || pgqs_backend) && pgqs_enabled && pgqs_is_query_sampled()
+	if ((pgqs || pgqs_backend) && pgqs_enabled && pgqs_is_query_sampled() &&
+		!qa_disable_stats
 #if PG_VERSION_NUM >= 90600
 		&& (!IsParallelWorker())
 #endif
@@ -649,7 +678,7 @@ pgqs_ExecutorEnd(QueryDesc *queryDesc)
 		context->queryId = queryDesc->plannedstmt->queryId;
 
 		if (context->queryId == 0)
-			context->queryId = pgqs_hash_string(queryDesc->sourceText, len);
+			context->queryId = pgss_hash_string(queryDesc->sourceText, len);
 
 		context->rtable = queryDesc->plannedstmt->rtable;
 		context->count = 0;
@@ -792,8 +821,10 @@ pgqs_ExecutorEnd(QueryDesc *queryDesc)
 
 			PGQS_LWL_RELEASE(pgqs->lock);
 		}
+
 		if (nodeTag(queryDesc->plannedstmt->planTree) == T_ModifyTable)
-			pgqsInsertOverheadHash((ModifyTable *) queryDesc->plannedstmt->planTree, context);		
+			pgqsInsertOverheadHash((ModifyTable *) queryDesc->plannedstmt->planTree, context);
+		
 	}
 
 cleanup:
@@ -801,6 +832,68 @@ cleanup:
 		prev_ExecutorEnd(queryDesc);
 	else
 		standard_ExecutorEnd(queryDesc);
+}
+
+/*
+ * ProcessUtility hook
+ */
+static void
+pgqs_ProcessUtility(PlannedStmt *pstmt,
+					const char *queryString,
+#if PG_VERSION_NUM >= 140000
+					bool readOnlyTree,
+#endif
+					ProcessUtilityContext context,
+					ParamListInfo params,
+					QueryEnvironment *queryEnv,
+					DestReceiver *dest,
+#if PG_VERSION_NUM < 130000
+					char *completionTag
+#else
+					QueryCompletion *qc
+#endif
+					)
+{
+	PG_TRY();
+	{
+		is_utility = true;
+
+		if (prev_ProcessUtility)
+			prev_ProcessUtility(pstmt, queryString,
+#if PG_VERSION_NUM >= 140000
+								readOnlyTree,
+#endif
+								context, params,
+								queryEnv,
+								dest,
+#if PG_VERSION_NUM < 130000
+									completionTag
+#else
+									qc
+#endif
+								);
+		else
+			standard_ProcessUtility(pstmt, queryString,
+#if PG_VERSION_NUM >= 140000
+									readOnlyTree,
+#endif
+									context, params,
+									queryEnv,
+									dest,
+#if PG_VERSION_NUM < 130000
+									completionTag
+#else
+									qc
+#endif
+						  );
+		is_utility = false;
+	}
+	PG_CATCH();
+	{
+		is_utility = false;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 }
 
 /* Initialize all non-key fields of the given entry. */
