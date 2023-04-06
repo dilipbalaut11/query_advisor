@@ -1260,7 +1260,15 @@ qa_plan_query(QueryInfo *queryinfo, bool *have_internal_subtxn,
 #endif
 								0,
 								NULL);
-			qa_plan_cost = plan->planTree->total_cost;
+
+			/*
+			 * logically this should not happen, but in case there is something
+			 * wrong then ignore the query instead of crashing.
+			 */
+			if (plan == NULL)
+				queryinfo->failed = true;
+			else
+				qa_plan_cost = plan->planTree->total_cost;
 		}
 	}
 	PG_CATCH();
