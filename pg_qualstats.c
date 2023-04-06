@@ -170,11 +170,21 @@ static void pgqs_ProcessUtility(PlannedStmt *pstmt,
 								QueryCompletion *qc
 #endif
 								);
+
+static void pgqs_ExplainOneQuery(Query *query,
+								 int cursorOptions,
+								 IntoClause *into,
+								 ExplainState *es,
+								 const char *queryString,
+								 ParamListInfo params,
+								 QueryEnvironment *queryEnv);
+
 static ExecutorStart_hook_type prev_ExecutorStart = NULL;
 static ExecutorRun_hook_type prev_ExecutorRun = NULL;
 static ExecutorFinish_hook_type prev_ExecutorFinish = NULL;
 static ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
 static ProcessUtility_hook_type prev_ProcessUtility = NULL;
+static ExplainOneQuery_hook_type prev_ExplainOneQuery_hook = NULL;
 #if PG_VERSION_NUM >= 150000
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
 #endif
@@ -197,6 +207,7 @@ static bool pgqs_track_pgcatalog = false;	/* track queries on pg_catalog */
 static bool pgqs_resolve_oids = false;	/* resolve oids */
 static bool pgqs_enabled;
 static bool	is_utility = false;
+static bool is_explain = false;
 static bool pgqs_track_constants = true;
 static double pgqs_sample_rate;
 static int	pgqs_min_err_ratio;
@@ -304,6 +315,8 @@ _PG_init(void)
 	ExecutorEnd_hook = pgqs_ExecutorEnd;
 	prev_ProcessUtility = ProcessUtility_hook;
 	ProcessUtility_hook = pgqs_ProcessUtility;
+	prev_ExplainOneQuery_hook = ExplainOneQuery_hook;
+	ExplainOneQuery_hook = pgqs_ExplainOneQuery;
 	prev_get_relation_info_hook = get_relation_info_hook;
 	get_relation_info_hook = hypo_get_relation_info_hook;
 	prev_explain_get_index_name_hook = explain_get_index_name_hook;
@@ -530,7 +543,7 @@ pgqs_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
 	/* Setup instrumentation */
 	if (pgqs_enabled  && strlen(queryDesc->sourceText) < pgqs_query_size &&
-		!qa_disable_stats && !is_utility)
+		!qa_disable_stats && (is_explain || !is_utility))
 	{
 		/*
 		 * For rate sampling, randomly choose top-level statement. Either all
@@ -804,11 +817,7 @@ pgqs_ExecutorEnd(QueryDesc *queryDesc)
 				/* Make sure it wasn't added by another backend */
 				if (!excl_found)
 				{
-					if (queryDesc->estate->es_top_eflags & EXEC_FLAG_EXPLAIN_ONLY)
-						queryEntry->isExplain = true;
-					else
-						queryEntry->isExplain = false;
-
+					queryEntry->isExplain = is_explain;
 					queryEntry->qrylen = len;
 					strcpy(queryEntry->querytext, context->querytext);
 					queryEntry->frequency = 1;
@@ -893,6 +902,69 @@ pgqs_ProcessUtility(PlannedStmt *pstmt,
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+}
+
+/*
+ * Explain one query hook
+ */
+static void
+pgqs_ExplainOneQuery(Query *query,
+					 int cursorOptions,
+					 IntoClause *into,
+					 ExplainState *es,
+					 const char *queryString,
+					 ParamListInfo params,
+					 QueryEnvironment *queryEnv)
+{
+	PlannedStmt	*actual_plan;
+	instr_time	planstart;
+	instr_time	planduration;
+
+	INSTR_TIME_SET_CURRENT(planstart);
+
+	if (prev_ExplainOneQuery_hook)
+		prev_ExplainOneQuery_hook(query, cursorOptions, into, es, queryString, params, queryEnv);
+
+
+	elog( DEBUG3, "Index Advisor: ENTER ExplainOneQuery_callback()" );
+
+	actual_plan = pg_plan_query(query,
+#if PG_VERSION_NUM >= 130000
+								queryString,
+#endif
+								cursorOptions, params);
+
+	INSTR_TIME_SET_CURRENT(planduration);
+	INSTR_TIME_SUBTRACT(planduration, planstart);
+
+	/* run it (if needed) and produce output */
+	if (qa_disable_stats)
+	{
+		qa_plan_cost = actual_plan->planTree->total_cost;
+
+		/* EXPLAIN the plan, with ANALYZE turned off */
+		es->analyze = es->buffers = false;
+
+		ExplainOnePlan(actual_plan, into, es, queryString, params,
+					   NULL, &planduration
+#if PG_VERSION_NUM >= 130000
+					   , NULL
+#endif
+					   );
+	}
+	else
+	{
+		if (params == NULL)
+			is_explain = true;
+
+		ExplainOnePlan(actual_plan, into, es, queryString, params,
+					   NULL, &planduration
+#if PG_VERSION_NUM >= 130000
+					   , NULL
+#endif
+					   );
+		is_explain = false;
+	}
 }
 
 /* Initialize all non-key fields of the given entry. */

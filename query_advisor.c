@@ -14,6 +14,7 @@
 
 #include "access/relation.h"
 #include "access/xact.h"
+#include "catalog/pg_am_d.h"
 #include "executor/spi.h"
 #include "funcapi.h"
 #include "miscadmin.h"
@@ -47,7 +48,7 @@ bool qa_disable_stats = false;
  * Advisor's planner hook will store the cost of the last planned query in
  * 'qa_plan_cost' variable.
  */
-static float qa_plan_cost = 0.0;
+float qa_plan_cost = 0.0;
 
 /* consider brin only if relation size is over 8 GB */
 #define QA_CONSIDER_BRIN(relpages)	((relpages) > 1024 * 1024)
@@ -87,6 +88,7 @@ typedef struct QueryInfo
 	double	cost;			/* query based cost */
 	int		frequency;		/* frequency of the execution */
 	bool	failed;			/* query execution failed do not try again */
+	bool	isexplain;		/* is this explain or explain analyze */
 	char   *query;			/* actual query text */
 } QueryInfo;
 
@@ -199,7 +201,7 @@ static QueryInfo *qa_get_queries(CandidateInfo *candidates,
 								 int ncandidates, int *nqueries);
 static bool qa_is_queryid_exists(int64 *queryids, int nqueryids,
 								 int64 queryid, int *idx);
-static char *qa_get_query(int64 queryid, int *freq);
+static char *qa_get_query(int64 queryid, int *freq, bool *isexplain);
 static CandidateInfo *qa_get_final_candidates(CandidateInfo *candidates,
 											  int *ncandidates,
 											  bool consider_brin);
@@ -712,7 +714,8 @@ qa_get_queries(CandidateInfo *candidates, int ncandidates,
 	for (i = 0; i < nids; i++)
 	{
 		queryinfos[i].query = qa_get_query(queryids[i],
-										   &queryinfos[i].frequency);
+										   &queryinfos[i].frequency,
+										   &queryinfos[i].isexplain);
 #ifdef DEBUG_INDEX_ADVISOR
 		elog(NOTICE, "query %d: %s-freq:%d", i, queryinfos[i].query, queryinfos[i].frequency);
 #endif
@@ -744,7 +747,7 @@ qa_is_queryid_exists(int64 *queryids, int nqueryids, int64 queryid,
 }
 
 static char *
-qa_get_query(int64 queryid, int *freq)
+qa_get_query(int64 queryid, int *freq, bool *isexplain)
 {
 	pgqsWorkloadEntry   *entry;
 	pgqsWorkloadHashKey	queryKey;
@@ -766,6 +769,7 @@ qa_get_query(int64 queryid, int *freq)
 	strcpy(query, entry->querytext);
 
 	*freq = entry->frequency;
+	*isexplain = entry->isExplain;
 
 	PGQS_LWL_RELEASE(pgqs->querylock);
 
@@ -1195,51 +1199,69 @@ qa_plan_query(QueryInfo *queryinfo, bool *have_internal_subtxn,
 
 	PG_TRY();
 	{
-		Oid	   *paramTypes = palloc0(sizeof(Oid));
-		int		numparam = 0;
-		List   *parseTreeList = NULL;
-		Node   *parseTreeNode;
-#if PG_VERSION_NUM >= 140000		
-		List   *queryTreeList = NULL;
-#endif		
-		Query  *query;
 		char   *querytext = queryinfo->query;
-		PlannedStmt *plan;
 
-		parseTreeList = pg_parse_query(querytext);
-		if (list_length(parseTreeList) != 1)
-			ereport(ERROR, (errmsg("cannot execute multiple utility events")));
+		/*
+		 * If workload query is explain then directly execute using SPI,
+		 * in explain hook we will take care of disabling the analyze if it is
+		 * explain analyze.  Normal query directly perform parsing and
+		 * planning.
+		 *
+		 * XXX as of now explain queries with param is not store in the
+		 * workload, in future if we want to support that then we might need
+		 * to store the parameter values as well.
+		 */
+		if (queryinfo->isexplain)
+		{
+			SPI_execute(querytext, false, 0);
+		}
+		else
+		{
+			Oid	   *paramTypes = palloc0(sizeof(Oid));
+			int		numparam = 0;
+			List   *parseTreeList = NULL;
+			Node   *parseTreeNode;
+#if PG_VERSION_NUM >= 140000		
+			List   *queryTreeList = NULL;
+#endif		
+			Query  *query;
+			PlannedStmt *plan;
 
-		parseTreeNode = (Node *) linitial(parseTreeList);
+			parseTreeList = pg_parse_query(querytext);
+			if (list_length(parseTreeList) != 1)
+				ereport(ERROR, (errmsg("cannot execute multiple utility events")));
 
-		query = parse_analyze_varparams((RawStmt *) parseTreeNode,
-										querytext,
-										&paramTypes,
-										&numparam
+			parseTreeNode = (Node *) linitial(parseTreeList);
+
+			query = parse_analyze_varparams((RawStmt *) parseTreeNode,
+											querytext,
+											&paramTypes,
+											&numparam
 #if PG_VERSION_NUM >= 150000
-										, NULL
+											, NULL
 #endif
 
 #ifdef EDB_ADVANCED_SERVER
-										, NULL, NULL
+											, NULL, NULL
 #endif
-										);
+											);
 
 #if PG_VERSION_NUM >= 140000
 
-		queryTreeList = pg_rewrite_query(query);
-		if (list_length(queryTreeList) != 1)
-			ereport(ERROR, (errmsg("can only execute a single query")));
+			queryTreeList = pg_rewrite_query(query);
+			if (list_length(queryTreeList) != 1)
+				ereport(ERROR, (errmsg("can only execute a single query")));
 
-		query = (Query *) linitial(queryTreeList);
+			query = (Query *) linitial(queryTreeList);
 #endif
-		plan = pg_plan_query(query,
+			plan = pg_plan_query(query,
 #if PG_VERSION_NUM >= 130000
-							 querytext,
+								querytext,
 #endif
-							 0,
-							 NULL);
-		qa_plan_cost = plan->planTree->total_cost;
+								0,
+								NULL);
+			qa_plan_cost = plan->planTree->total_cost;
+		}
 	}
 	PG_CATCH();
 	{
