@@ -260,7 +260,7 @@ static Size pgqs_sampled_array_size(void);
 
 /* Global Hash */
 HTAB *pgqs_hash = NULL;
-HTAB *pgqs_query_examples_hash = NULL;
+HTAB *pgqs_workload_hash = NULL;
 pgqsSharedState *pgqs = NULL;
 HTAB *pgqs_update_hash = NULL;
 
@@ -647,7 +647,7 @@ pgss_hash_string(const char *str, int len)
 static void
 pgqs_ExecutorEnd(QueryDesc *queryDesc)
 {
-	pgqsQueryStringHashKey queryKey;
+	pgqsWorkloadHashKey queryKey;
 	bool		found;
 
 	if ((pgqs || pgqs_backend) && pgqs_enabled && pgqs_is_query_sampled() &&
@@ -672,7 +672,7 @@ pgqs_ExecutorEnd(QueryDesc *queryDesc)
 		pgqsEntry  *localentry;
 		HASH_SEQ_STATUS local_hash_seq;
 		pgqsWalkerContext *context = palloc(sizeof(pgqsWalkerContext));
-		pgqsQueryStringEntry *queryEntry;
+		pgqsWorkloadEntry *queryEntry;
 		int			len = strlen(queryDesc->sourceText) + 1;
 
 		context->queryId = queryDesc->plannedstmt->queryId;
@@ -693,9 +693,9 @@ pgqs_ExecutorEnd(QueryDesc *queryDesc)
 		/* Lookup the hash table entry with a shared lock. */
 		PGQS_LWL_ACQUIRE(pgqs->querylock, LW_SHARED);
 
-		queryEntry = (pgqsQueryStringEntry *) hash_search_with_hash_value(pgqs_query_examples_hash, &queryKey,
-																		  context->queryId,
-																		  HASH_FIND, &found);
+		queryEntry = (pgqsWorkloadEntry *) hash_search_with_hash_value(pgqs_workload_hash, &queryKey,
+																	   context->queryId,
+																	   HASH_FIND, &found);
 
 		/* Create the new entry if not present */
 		if (!found)
@@ -706,7 +706,7 @@ pgqs_ExecutorEnd(QueryDesc *queryDesc)
 			PGQS_LWL_RELEASE(pgqs->querylock);
 			PGQS_LWL_ACQUIRE(pgqs->querylock, LW_EXCLUSIVE);
 
-			if (hash_get_num_entries(pgqs_query_examples_hash) >= pgqs_max_workload)
+			if (hash_get_num_entries(pgqs_workload_hash) >= pgqs_max_workload)
 			{
 				ereport(WARNING,
 						(errcode(ERRCODE_OUT_OF_MEMORY),
@@ -717,9 +717,9 @@ pgqs_ExecutorEnd(QueryDesc *queryDesc)
 				goto cleanup;
 			}
 
-			queryEntry = (pgqsQueryStringEntry *) hash_search_with_hash_value(pgqs_query_examples_hash, &queryKey,
-																				context->queryId,
-																				HASH_ENTER, &excl_found);
+			queryEntry = (pgqsWorkloadEntry *) hash_search_with_hash_value(pgqs_workload_hash, &queryKey,
+																		   context->queryId,
+																		   HASH_ENTER, &excl_found);
 
 			/* Make sure it wasn't added by another backend */
 			if (!excl_found)
@@ -1751,8 +1751,8 @@ pgqs_backend_mode_startup(void)
 	memset(&updateinfo, 0, sizeof(updateinfo));
 	info.keysize = sizeof(pgqsHashKey);
 	info.hcxt = TopMemoryContext;
-	queryinfo.keysize = sizeof(pgqsQueryStringHashKey);
-	queryinfo.entrysize = sizeof(pgqsQueryStringEntry) + pgqs_query_size * sizeof(char);
+	queryinfo.keysize = sizeof(pgqsWorkloadHashKey);
+	queryinfo.entrysize = sizeof(pgqsWorkloadEntry) + pgqs_query_size * sizeof(char);
 	queryinfo.hcxt = TopMemoryContext;
 	updateinfo.keysize = sizeof(pgqsUpdateHashKey);
 	updateinfo.entrysize = sizeof(pgqsUpdateHashEntry);
@@ -1771,7 +1771,7 @@ pgqs_backend_mode_startup(void)
 							 &info,
 							 HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
 
-	pgqs_query_examples_hash = hash_create("pg_qualqueryexamples_hash",
+	pgqs_workload_hash = hash_create("pg_qualqueryexamples_hash",
 											 pgqs_max_workload,
 											 &queryinfo,
 
@@ -1828,8 +1828,8 @@ pgqs_shmem_startup(void)
 	memset(&queryinfo, 0, sizeof(queryinfo));
 	memset(&updateinfo, 0, sizeof(updateinfo));
 	info.keysize = sizeof(pgqsHashKey);
-	queryinfo.keysize = sizeof(pgqsQueryStringHashKey);
-	queryinfo.entrysize = sizeof(pgqsQueryStringEntry) + pgqs_query_size * sizeof(char);
+	queryinfo.keysize = sizeof(pgqsWorkloadHashKey);
+	queryinfo.entrysize = sizeof(pgqsWorkloadEntry) + pgqs_query_size * sizeof(char);
 	updateinfo.keysize = sizeof(pgqsUpdateHashKey);
 	updateinfo.entrysize = sizeof(pgqsUpdateHashEntry);
 	updateinfo.hash = pgqs_update_hash_fn;
@@ -1864,7 +1864,7 @@ pgqs_shmem_startup(void)
 							  &info,
 							  HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
 
-	pgqs_query_examples_hash = ShmemInitHash("pg_qualqueryexamples_hash",
+	pgqs_workload_hash = ShmemInitHash("pg_qualqueryexamples_hash",
 											 pgqs_max_workload,
 											 pgqs_max_workload,
 											 &queryinfo,
@@ -1887,7 +1887,8 @@ Datum
 pg_qualstats_reset(PG_FUNCTION_ARGS)
 {
 	HASH_SEQ_STATUS hash_seq;
-	pgqsEntry  *entry;
+	pgqsEntry	   *entry;
+	pgqsWorkloadEntry *qryentry;
 
 	if ((!pgqs && !pgqs_backend) || !pgqs_hash)
 	{
@@ -1905,6 +1906,17 @@ pg_qualstats_reset(PG_FUNCTION_ARGS)
 	}
 
 	PGQS_LWL_RELEASE(pgqs->lock);
+
+	PGQS_LWL_ACQUIRE(pgqs->querylock, LW_EXCLUSIVE);
+
+	hash_seq_init(&hash_seq, pgqs_workload_hash);
+	while ((qryentry = hash_seq_search(&hash_seq)) != NULL)
+	{
+		hash_search_with_hash_value(pgqs_workload_hash, &qryentry->key,
+									qryentry->key.queryid, HASH_REMOVE, NULL);
+	}
+
+	PGQS_LWL_RELEASE(pgqs->querylock);
 	PG_RETURN_VOID();
 }
 
@@ -2186,9 +2198,9 @@ pg_qualstats_example_queries(PG_FUNCTION_ARGS)
 	MemoryContext per_query_ctx;
 	MemoryContext oldcontext;
 	HASH_SEQ_STATUS hash_seq;
-	pgqsQueryStringEntry *entry;
+	pgqsWorkloadEntry *entry;
 
-	if ((!pgqs && !pgqs_backend) || !pgqs_query_examples_hash)
+	if ((!pgqs && !pgqs_backend) || !pgqs_workload_hash)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("pg_qualstats must be loaded via shared_preload_libraries")));
@@ -2218,7 +2230,7 @@ pg_qualstats_example_queries(PG_FUNCTION_ARGS)
 	MemoryContextSwitchTo(oldcontext);
 
 	PGQS_LWL_ACQUIRE(pgqs->querylock, LW_SHARED);
-	hash_seq_init(&hash_seq, pgqs_query_examples_hash);
+	hash_seq_init(&hash_seq, pgqs_workload_hash);
 
 	while ((entry = hash_seq_search(&hash_seq)) != NULL)
 	{
@@ -2252,7 +2264,7 @@ pg_qualstats_status(PG_FUNCTION_ARGS)
 	Datum		values[2];
 	bool		nulls[2];
 
-	if ((!pgqs && !pgqs_backend) || !pgqs_query_examples_hash)
+	if ((!pgqs && !pgqs_backend) || !pgqs_workload_hash)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("pg_qualstats must be loaded via shared_preload_libraries")));
@@ -2293,7 +2305,7 @@ pg_qualstats_status(PG_FUNCTION_ARGS)
 
 	PGQS_LWL_ACQUIRE(pgqs->querylock, LW_SHARED);
 	values[0] = CStringGetTextDatum("query_advisor_workload_hash");
-	values[1] = Float4GetDatum((float4) hash_get_num_entries(pgqs_query_examples_hash) * 100 / pgqs_max_qual);
+	values[1] = Float4GetDatum((float4) hash_get_num_entries(pgqs_workload_hash) * 100 / pgqs_max_qual);
 	tuplestore_putvalues(tupstore, tupdesc, values, nulls);
 
 	values[0] = CStringGetTextDatum("query_advisor_update_hash");
@@ -2470,7 +2482,7 @@ pgqs_memsize(void)
 		 * non-normalized queries.
 		 */
 		size = add_size(size, hash_estimate_size(pgqs_max_workload,
-												 sizeof(pgqsQueryStringEntry) + pgqs_query_size * sizeof(char)));
+												 sizeof(pgqsWorkloadEntry) + pgqs_query_size * sizeof(char)));
 	}
 	size = add_size(size, hash_estimate_size(pgqs_max_update,
 											 sizeof(pgqsUpdateHashEntry)));	
@@ -2626,7 +2638,7 @@ exprRepr(Expr *expr, StringInfo buffer, pgqsWalkerContext *context, bool include
 static uint32
 pgqs_uint32_hashfn(const void *key, Size keysize)
 {
-	return ((pgqsQueryStringHashKey *) key)->queryid;
+	return ((pgqsWorkloadHashKey *) key)->queryid;
 }
 #endif
 

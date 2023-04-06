@@ -120,14 +120,14 @@ typedef struct pgqsEntryWithNames
 	pgqsNames	names;
 } pgqsEntryWithNames;
 
-typedef struct pgqsQueryStringHashKey
+typedef struct pgqsWorkloadHashKey
 {
 	pgqs_queryid queryid;
-} pgqsQueryStringHashKey;
+} pgqsWorkloadHashKey;
 
-typedef struct pgqsQueryStringEntry
+typedef struct pgqsWorkloadEntry
 {
-	pgqsQueryStringHashKey key;
+	pgqsWorkloadHashKey key;
 	int			frequency;
 	bool		isExplain;		
 	int			qrylen;
@@ -137,7 +137,7 @@ typedef struct pgqsQueryStringEntry
 	 * query_size, which is track_activity_query_size
 	 */
 	char		querytext[1];
-} pgqsQueryStringEntry;
+} pgqsWorkloadEntry;
 
 typedef struct pgqsUpdateHashKey
 {
@@ -156,7 +156,7 @@ typedef struct pgqsUpdateHashEntry
 
 /* Global Hash */
 extern HTAB *pgqs_hash;
-extern HTAB *pgqs_query_examples_hash;
+extern HTAB *pgqs_workload_hash;
 extern pgqsSharedState *pgqs;
 extern HTAB *pgqs_update_hash;
 

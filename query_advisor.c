@@ -736,15 +736,15 @@ qa_is_queryid_exists(int64 *queryids, int nqueryids, int64 queryid,
 static char *
 qa_get_query(int64 queryid, int *freq)
 {
-	pgqsQueryStringEntry   *entry;
-	pgqsQueryStringHashKey	queryKey;
+	pgqsWorkloadEntry   *entry;
+	pgqsWorkloadHashKey	queryKey;
 	char   *query = NULL;
 	bool	found;
 
 	queryKey.queryid = queryid;
 
 	PGQS_LWL_ACQUIRE(pgqs->querylock, LW_SHARED);
-	entry = hash_search_with_hash_value(pgqs_query_examples_hash, &queryKey,
+	entry = hash_search_with_hash_value(pgqs_workload_hash, &queryKey,
 										queryid, HASH_FIND, &found);
 	if (!found)
 	{
