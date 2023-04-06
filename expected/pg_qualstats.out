@@ -1,15 +1,15 @@
-CREATE SCHEMA "PGQS";
-CREATE EXTENSION pg_qualstats WITH SCHEMA "PGQS";
+CREATE EXTENSION query_advisor;
 -- Make sure that installcheck won't find previous data
-SELECT "PGQS".pg_qualstats_reset();
- pg_qualstats_reset 
---------------------
+SELECT query_advisor_qualstats_reset();
+ query_advisor_qualstats_reset 
+-------------------------------
  
 (1 row)
 
 -- Make sure sure we'll see at least one qual
-SET pg_qualstats.sample_rate = 1;
-CREATE TABLE pgqs AS SELECT id, 'a'::text val FROM generate_series(1, 100) id;
+SET query_advisor.sample_rate = 1;
+CREATE TABLE pgqs AS SELECT id, 'a'::text val FROM generate_series(1, 100000) id;
+ANALYZE pgqs;
 SELECT COUNT(*) FROM pgqs WHERE id = 1;
  count 
 -------
@@ -18,37 +18,37 @@ SELECT COUNT(*) FROM pgqs WHERE id = 1;
 
 SELECT lrelid::regclass::text, lattnum, occurences, execution_count,
     nbfiltered, constvalue, eval_type
-FROM "PGQS".pg_qualstats;
+FROM query_advisor_qualstats();
  lrelid | lattnum | occurences | execution_count | nbfiltered | constvalue | eval_type 
 --------+---------+------------+-----------------+------------+------------+-----------
- pgqs   |       1 |          1 |             100 |         99 | 1::integer | f
+ pgqs   |       1 |          1 |          100000 |      99999 | 1::integer | f
 (1 row)
 
-SELECT COUNT(*) > 0 FROM "PGQS".pg_qualstats;
+SELECT COUNT(*) > 0 FROM query_advisor_qualstats;
  ?column? 
 ----------
  t
 (1 row)
 
-SELECT COUNT(*) > 0 FROM "PGQS".pg_qualstats();
+SELECT COUNT(*) > 0 FROM query_advisor_qualstats();
  ?column? 
 ----------
  t
 (1 row)
 
-SELECT COUNT(*) > 0 FROM "PGQS".pg_qualstats_example_queries();
+SELECT COUNT(*) > 0 FROM query_advisor_workload_queries();
  ?column? 
 ----------
  t
 (1 row)
 
-SELECT "PGQS".pg_qualstats_reset();
- pg_qualstats_reset 
---------------------
+SELECT query_advisor_qualstats_reset();
+ query_advisor_qualstats_reset 
+-------------------------------
  
 (1 row)
 
-SELECT COUNT(*) FROM "PGQS".pg_qualstats();
+SELECT COUNT(*) FROM query_advisor_qualstats();
  count 
 -------
      0
@@ -61,7 +61,7 @@ SELECT * FROM (SELECT * FROM pgqs LIMIT 0) pgqs WHERE pgqs.id = 0;
 ----+-----
 (0 rows)
 
-SELECT COUNT(*) FROM "PGQS".pg_qualstats();
+SELECT COUNT(*) FROM query_advisor_qualstats();
  count 
 -------
      0
@@ -73,15 +73,15 @@ SELECT * FROM pgqs WHERE 'meh' ~ val;
 ----+-----
 (0 rows)
 
-SELECT lrelid::regclass, lattnum, rrelid::regclass, rattnum FROM "PGQS".pg_qualstats();
+SELECT lrelid::regclass, lattnum, rrelid::regclass, rattnum FROM query_advisor_qualstats();
  lrelid | lattnum | rrelid | rattnum 
 --------+---------+--------+---------
         |         | pgqs   |       2
 (1 row)
 
-SELECT "PGQS".pg_qualstats_reset();
- pg_qualstats_reset 
---------------------
+SELECT query_advisor_qualstats_reset();
+ query_advisor_qualstats_reset 
+-------------------------------
  
 (1 row)
 
@@ -96,7 +96,7 @@ SELECT * FROM pgqs WHERE 3 = id % 2;
 ----+-----
 (0 rows)
 
-SELECT COUNT(*) FROM "PGQS".pg_qualstats();
+SELECT COUNT(*) FROM query_advisor_qualstats();
  count 
 -------
      0
@@ -114,23 +114,23 @@ SELECT * FROM pgqs WHERE 0 = id;
 (0 rows)
 
 SELECT lrelid::regclass, lattnum, rrelid::regclass, rattnum, sum(occurences)
-FROM "PGQS".pg_qualstats()
+FROM query_advisor_qualstats()
 GROUP by 1, 2, 3, 4;
  lrelid | lattnum | rrelid | rattnum | sum 
 --------+---------+--------+---------+-----
  pgqs   |       1 |        |         |   2
 (1 row)
 
-SELECT COUNT(DISTINCT qualnodeid) FROM "PGQS".pg_qualstats();
+SELECT COUNT(DISTINCT qualnodeid) FROM query_advisor_qualstats();
  count 
 -------
      1
 (1 row)
 
 -- (unique)qualid behavior
-SELECT "PGQS".pg_qualstats_reset();
- pg_qualstats_reset 
---------------------
+SELECT query_advisor_qualstats_reset();
+ query_advisor_qualstats_reset 
+-------------------------------
  
 (1 row)
 
@@ -142,7 +142,7 @@ SELECT COUNT(*) FROM pgqs WHERE (id = 1) OR (id > 10 AND id < 20);
 (1 row)
 
 SELECT CASE WHEN qualid IS NULL THEN 'OR-ed' ELSE 'AND-ed' END kind, COUNT(*)
-FROM "PGQS".pg_qualstats() GROUP BY 1 ORDER BY 2 DESC;
+FROM query_advisor_qualstats() GROUP BY 1 ORDER BY 2 DESC;
   kind  | count 
 --------+-------
  AND-ed |     2
@@ -153,24 +153,24 @@ FROM "PGQS".pg_qualstats() GROUP BY 1 ORDER BY 2 DESC;
 -- index advisor
 ----------------
 -- check that empty arrays are returned rather than NULL values
-SELECT "PGQS".pg_qualstats_reset();
- pg_qualstats_reset 
---------------------
+SELECT query_advisor_qualstats_reset();
+ query_advisor_qualstats_reset 
+-------------------------------
  
 (1 row)
 
-SELECT * FROM "PGQS".pg_qualstats_index_advisor(50);
-      pg_qualstats_index_advisor      
---------------------------------------
- {"indexes" : [], "unoptimised" : []}
-(1 row)
+SELECT * FROM query_advisor_index_recommendations(50);
+ index | estimated_size_in_bytes | estimated_pct_cost_reduction 
+-------+-------------------------+------------------------------
+(0 rows)
 
 -- Test some naive scenario
 CREATE TABLE adv (id1 integer, id2 integer, id3 integer, val text);
-INSERT INTO adv SELECT i, i, i, 'line ' || i from generate_series(1, 1000) i;
-SELECT "PGQS".pg_qualstats_reset();
- pg_qualstats_reset 
---------------------
+INSERT INTO adv SELECT i, i, i, 'line ' || i from generate_series(1, 100000) i;
+ANALYZE adv;
+SELECT query_advisor_qualstats_reset();
+ query_advisor_qualstats_reset 
+-------------------------------
  
 (1 row)
 
@@ -232,38 +232,4 @@ SELECT * FROM adv WHERE val LIKE 'moh';
  id1 | id2 | id3 | val 
 -----+-----+-----+-----
 (0 rows)
-
--- check the results
-SELECT v->'ddl' AS v
-  FROM json_array_elements(
-    "PGQS".pg_qualstats_index_advisor(50)->'indexes') v
-  ORDER BY v::text COLLATE "C";
-                               v                               
----------------------------------------------------------------
- "CREATE INDEX ON public.adv USING btree (id1)"
- "CREATE INDEX ON public.adv USING btree (val, id1, id2, id3)"
- "CREATE INDEX ON public.pgqs USING btree (id)"
-(3 rows)
-
-SELECT v->'qual' AS v
-  FROM json_array_elements(
-    "PGQS".pg_qualstats_index_advisor(50)->'unoptimised') v
-  ORDER BY v::text COLLATE "C";
-        v        
------------------
- "adv.val ~~ ?"
- "adv.val ~~* ?"
-(2 rows)
-
--- check quals on removed table
-DROP TABLE pgqs;
-SELECT v->'ddl' AS v
-  FROM json_array_elements(
-    "PGQS".pg_qualstats_index_advisor(50)->'indexes') v
-  ORDER BY v::text COLLATE "C";
-                               v                               
----------------------------------------------------------------
- "CREATE INDEX ON public.adv USING btree (id1)"
- "CREATE INDEX ON public.adv USING btree (val, id1, id2, id3)"
-(2 rows)
 
