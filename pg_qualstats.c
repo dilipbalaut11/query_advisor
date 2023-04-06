@@ -690,57 +690,6 @@ pgqs_ExecutorEnd(QueryDesc *queryDesc)
 		context->querytext = queryDesc->sourceText;
 		queryKey.queryid = context->queryId;
 
-		/* Lookup the hash table entry with a shared lock. */
-		PGQS_LWL_ACQUIRE(pgqs->querylock, LW_SHARED);
-
-		queryEntry = (pgqsWorkloadEntry *) hash_search_with_hash_value(pgqs_workload_hash, &queryKey,
-																	   context->queryId,
-																	   HASH_FIND, &found);
-
-		/* Create the new entry if not present */
-		if (!found)
-		{
-			bool		excl_found;
-
-			/* Need exclusive lock to add a new hashtable entry - promote */
-			PGQS_LWL_RELEASE(pgqs->querylock);
-			PGQS_LWL_ACQUIRE(pgqs->querylock, LW_EXCLUSIVE);
-
-			if (hash_get_num_entries(pgqs_workload_hash) >= pgqs_max_workload)
-			{
-				ereport(WARNING,
-						(errcode(ERRCODE_OUT_OF_MEMORY),
-						 errmsg("workload hash table is full so current query is skipped"),
-						 errhint("reset the stats or increase value of pgqs_max_workload and restart")));
-				PGQS_LWL_RELEASE(pgqs->querylock);
-
-				goto cleanup;
-			}
-
-			queryEntry = (pgqsWorkloadEntry *) hash_search_with_hash_value(pgqs_workload_hash, &queryKey,
-																		   context->queryId,
-																		   HASH_ENTER, &excl_found);
-
-			/* Make sure it wasn't added by another backend */
-			if (!excl_found)
-			{
-				if (queryDesc->estate->es_top_eflags & EXEC_FLAG_EXPLAIN_ONLY)
-					queryEntry->isExplain = true;
-				else
-					queryEntry->isExplain = false;
-
-				queryEntry->qrylen = len;
-				strcpy(queryEntry->querytext, context->querytext);
-				queryEntry->frequency = 1;
-			}
-			else
-				queryEntry->frequency++;
-		}
-		else
-			queryEntry->frequency++;
-
-		PGQS_LWL_RELEASE(pgqs->querylock);
-
 		/* create local hash table if it hasn't been created yet */
 		if (!pgqs_localhash)
 		{
@@ -820,11 +769,61 @@ pgqs_ExecutorEnd(QueryDesc *queryDesc)
 			}
 
 			PGQS_LWL_RELEASE(pgqs->lock);
+
+			/* Lookup the hash table entry with a shared lock. */
+			PGQS_LWL_ACQUIRE(pgqs->querylock, LW_SHARED);
+
+			queryEntry = (pgqsWorkloadEntry *) hash_search_with_hash_value(pgqs_workload_hash, &queryKey,
+																		   context->queryId,
+																		   HASH_FIND, &found);
+
+			/* Create the new entry if not present */
+			if (!found)
+			{
+				bool		excl_found;
+
+				/* Need exclusive lock to add a new hashtable entry - promote */
+				PGQS_LWL_RELEASE(pgqs->querylock);
+				PGQS_LWL_ACQUIRE(pgqs->querylock, LW_EXCLUSIVE);
+
+				if (hash_get_num_entries(pgqs_workload_hash) >= pgqs_max_workload)
+				{
+					ereport(WARNING,
+							(errcode(ERRCODE_OUT_OF_MEMORY),
+							errmsg("workload hash table is full so current query is skipped"),
+							errhint("reset the stats or increase value of pgqs_max_workload and restart")));
+					PGQS_LWL_RELEASE(pgqs->querylock);
+
+					goto cleanup;
+				}
+
+				queryEntry = (pgqsWorkloadEntry *) hash_search_with_hash_value(pgqs_workload_hash, &queryKey,
+																			   context->queryId,
+																			   HASH_ENTER, &excl_found);
+
+				/* Make sure it wasn't added by another backend */
+				if (!excl_found)
+				{
+					if (queryDesc->estate->es_top_eflags & EXEC_FLAG_EXPLAIN_ONLY)
+						queryEntry->isExplain = true;
+					else
+						queryEntry->isExplain = false;
+
+					queryEntry->qrylen = len;
+					strcpy(queryEntry->querytext, context->querytext);
+					queryEntry->frequency = 1;
+				}
+				else
+					queryEntry->frequency++;
+			}
+			else
+				queryEntry->frequency++;
+
+			PGQS_LWL_RELEASE(pgqs->querylock);
 		}
 
 		if (nodeTag(queryDesc->plannedstmt->planTree) == T_ModifyTable)
 			pgqsInsertOverheadHash((ModifyTable *) queryDesc->plannedstmt->planTree, context);
-		
 	}
 
 cleanup:
