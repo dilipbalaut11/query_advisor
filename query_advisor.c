@@ -18,6 +18,7 @@
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "optimizer/optimizer.h"
+#include "optimizer/plancat.h"
 #include "parser/analyze.h"
 #include "utils/builtins.h"
 
@@ -47,6 +48,9 @@ bool qa_disable_stats = false;
  * 'qa_plan_cost' variable.
  */
 static float qa_plan_cost = 0.0;
+
+/* consider brin only if relation size is over 8 GB */
+#define QA_CONSIDER_BRIN(relpages)	((relpages) > 1024 * 1024)
 
 /* Array of the final selected indexes */
 typedef struct FinalIndexInfo
@@ -178,7 +182,7 @@ char *query =
 "\n			 avg_selectivity >= $2"
 "\n          GROUP BY (qual).relid, amname, parent"
 "\n        )"
-"\nSELECT * FROM filtered where amname='btree' ORDER BY relid, amname DESC, cardinality(attnumlist);";
+"\nSELECT * FROM filtered where amname='btree' OR amname='brin' ORDER BY relid, amname DESC, cardinality(attnumlist);";
 
 /* static function declarations */
 static FinalIndexInfo *qa_generate_advise(MemoryContext per_query_ctx,
@@ -197,7 +201,8 @@ static bool qa_is_queryid_exists(int64 *queryids, int nqueryids,
 								 int64 queryid, int *idx);
 static char *qa_get_query(int64 queryid, int *freq);
 static CandidateInfo *qa_get_final_candidates(CandidateInfo *candidates,
-											  int *ncandidates);
+											  int *ncandidates,
+											  bool consider_brin);
 static bool qa_is_candidate_exists(CandidateInfo *candidates,
 								   CandidateInfo *cand,
 								   int ncandidates);
@@ -420,7 +425,10 @@ qa_process_rel(FinalIndexInfo *previnxinfos, CandidateInfo *candidates,
 	IndexAdvisorContext	context;
 	MemoryContext 		oldcontext;
 	FinalIndexInfo	   *indexinfos = NULL;
-	Relation			rel;
+	Relation	rel;
+	BlockNumber relpages;
+	double	reltuples;
+	double	allvisfrac;
 	int		nqueries;
 	int		nnewindexes;
 	int		prev_indexes = *nindexes;
@@ -432,6 +440,11 @@ qa_process_rel(FinalIndexInfo *previnxinfos, CandidateInfo *candidates,
 
 	if (ncandidates == 0)
 		return previnxinfos;
+
+	rel = try_relation_open(candidates[0].relid, AccessShareLock);
+	if (rel == NULL)
+		return previnxinfos;
+	estimate_rel_size(rel, NULL, &relpages, &reltuples, &allvisfrac);
 
 	/*
 	 * Process all candidate and get the list of all the unique queryids along
@@ -448,7 +461,8 @@ qa_process_rel(FinalIndexInfo *previnxinfos, CandidateInfo *candidates,
 	 * candidates which can increasing the time complexity.  In future if
 	 * required we can consider candidates with more columns.
 	 */
-	finalcand = qa_get_final_candidates(candidates, &ncandidates);
+	finalcand = qa_get_final_candidates(candidates, &ncandidates,
+										QA_CONSIDER_BRIN(relpages));
 	qa_remove_existing_candidates(finalcand, ncandidates);
 
 	/*
@@ -456,10 +470,6 @@ qa_process_rel(FinalIndexInfo *previnxinfos, CandidateInfo *candidates,
 	 * performing on key attributes for each candidate.
 	 */
 	qa_get_updates(finalcand, ncandidates);
-
-	rel = try_relation_open(candidates[0].relid, AccessShareLock);
-	if (rel == NULL)
-		return previnxinfos;
 
 	/*
 	 * Generate index creation statement for each candidate.  We need to output
@@ -767,7 +777,8 @@ qa_get_query(int64 queryid, int *freq)
  * index candidate array.
  */
 static CandidateInfo *
-qa_get_final_candidates(CandidateInfo *candidates, int *ncandidates)
+qa_get_final_candidates(CandidateInfo *candidates, int *ncandidates,
+						bool consider_brin)
 {
 	CandidateInfo *finalcand;
 	CandidateInfo	cand;
@@ -786,6 +797,9 @@ qa_get_final_candidates(CandidateInfo *candidates, int *ncandidates)
 	/* genrate all one and tow length index combinations. */
 	for (i = 0; i < *ncandidates; i++)
 	{
+		if (candidates[i].amoid == BRIN_AM_OID && !consider_brin)
+			continue;
+
 		for (j = 0; j < candidates[i].nattrs; j++)
 		{
 			/* generae one column index */
