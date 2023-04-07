@@ -123,9 +123,7 @@ CREATE FUNCTION query_advisor_qualstats(
   OUT max_err_estimate_num bigint,
   OUT mean_err_estimate_num double precision,
   OUT stddev_err_estimate_num double precision,
-  OUT constant_position int,
   OUT queryid    bigint,
-  OUT constvalue varchar,
   OUT eval_type  "char"
 )
 RETURNS SETOF record

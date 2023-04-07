@@ -197,7 +197,7 @@ static bool pgqs_track_pgcatalog = false;	/* track queries on pg_catalog */
 static bool pgqs_resolve_oids = false;	/* resolve oids */
 static bool pgqs_enabled;
 static bool	is_utility = false;
-static bool pgqs_track_constants = true;
+static bool pgqs_track_constants = false;
 static double pgqs_sample_rate;
 static int	pgqs_min_err_ratio;
 static int	pgqs_min_err_num;
@@ -1248,7 +1248,6 @@ pgqs_process_booltest(BooleanTest *expr, pgqsWalkerContext *context)
 	bool		found;
 	Var		   *var;
 	Expr	   *newexpr = NULL;
-	char	   *constant;
 	Oid			opoid;
 	RangeTblEntry *rte;
 
@@ -1267,27 +1266,21 @@ pgqs_process_booltest(BooleanTest *expr, pgqsWalkerContext *context)
 	switch (expr->booltesttype)
 	{
 		case IS_TRUE:
-			constant = "TRUE::bool";
 			opoid = BooleanEqualOperator;
 			break;
 		case IS_FALSE:
-			constant = "FALSE::bool";
 			opoid = BooleanEqualOperator;
 			break;
 		case IS_NOT_TRUE:
-			constant = "TRUE::bool";
 			opoid = BooleanNotEqualOperator;
 			break;
 		case IS_NOT_FALSE:
-			constant = "FALSE::bool";
 			opoid = BooleanNotEqualOperator;
 			break;
 		case IS_UNKNOWN:
-			constant = "NULL::bool";
 			opoid = BooleanEqualOperator;
 			break;
 		case IS_NOT_UNKNOWN:
-			constant = "NULL::bool";
 			opoid = BooleanNotEqualOperator;
 			break;
 		default:
@@ -1318,19 +1311,6 @@ pgqs_process_booltest(BooleanTest *expr, pgqsWalkerContext *context)
 			entry->lrelid = rte->relid;
 			entry->lattnum = var->varattno;
 		}
-
-		if (pgqs_track_constants)
-		{
-			char	   *utf8const = (char *) pg_do_encoding_conversion((unsigned char *) constant,
-																	   strlen(constant),
-																	   GetDatabaseEncoding(),
-																	   PG_UTF8);
-
-			Assert(strlen(utf8const) < PGQS_CONSTANT_SIZE);
-			strcpy(entry->constvalue, utf8const);
-		}
-		else
-			memset(entry->constvalue, 0, sizeof(char) * PGQS_CONSTANT_SIZE);
 
 		if (pgqs_resolve_oids)
 			pgqs_fillnames((pgqsEntryWithNames *) entry);
@@ -1639,9 +1619,6 @@ pgqs_process_opexpr(OpExpr *expr, pgqsWalkerContext *context)
 											  &found);
 			if (!found)
 			{
-				char	   *utf8const;
-				int			len;
-
 				context->nentries++;
 
 				/* raw copy the temporary entry */
@@ -1649,24 +1626,6 @@ pgqs_process_opexpr(OpExpr *expr, pgqsWalkerContext *context)
 				entry->position = position;
 				entry->qualnodeid = hashExpr((Expr *) expr, context, false);
 				entry->qualid = context->qualid;
-
-				utf8const = (char *) pg_do_encoding_conversion((unsigned char *) buf->data,
-															   strlen(buf->data),
-															   GetDatabaseEncoding(),
-															   PG_UTF8);
-				len = strlen(utf8const);
-
-				/*
-				 * The const value can use multibyte characters, so we need to
-				 * be careful when truncating the value.  Note that we need to
-				 * use PG_UTF8 encoding explicitly here, as the value was just
-				 * converted to this encoding.
-				 */
-				len = pg_encoding_mbcliplen(PG_UTF8, utf8const, len,
-											PGQS_CONSTANT_SIZE - 1);
-
-				memcpy(entry->constvalue, utf8const, len);
-				entry->constvalue[len] = '\0';
 
 				if (pgqs_resolve_oids)
 					pgqs_fillnames((pgqsEntryWithNames *) entry);
@@ -1921,8 +1880,8 @@ pg_qualstats_reset(PG_FUNCTION_ARGS)
 
 /* Number of output arguments (columns) for various API versions */
 #define PG_QUALSTATS_COLS_V1_0	18
-#define PG_QUALSTATS_COLS_V2_0	26
-#define PG_QUALSTATS_COLS		26	/* maximum of above */
+#define PG_QUALSTATS_COLS_V2_0	24
+#define PG_QUALSTATS_COLS		24	/* maximum of above */
 
 /*
  * Retrieve statement statistics.
@@ -1970,22 +1929,9 @@ pg_qualstats_common(PG_FUNCTION_ARGS, pgqsVersion api_version,
 	MemoryContext per_query_ctx;
 	MemoryContext oldcontext;
 	HASH_SEQ_STATUS hash_seq;
-	Oid			userid = GetUserId();
-	bool		is_allowed_role = false;
 	pgqsEntry  *entry;
 	Datum	   *values;
 	bool	   *nulls;
-
-#if PG_VERSION_NUM >= 140000
-	/* Superusers or members of pg_read_all_stats members are allowed */
-	is_allowed_role = is_member_of_role(GetUserId(), ROLE_PG_READ_ALL_STATS);
-#elif PG_VERSION_NUM >= 100000
-	/* Superusers or members of pg_read_all_stats members are allowed */
-	is_allowed_role = is_member_of_role(GetUserId(), DEFAULT_ROLE_READ_ALL_STATS);
-#else
-	 /* Superusers are allowed */
-	is_allowed_role = superuser();
-#endif
 
 	if ((!pgqs && !pgqs_backend) || !pgqs_hash)
 		ereport(ERROR,
@@ -2011,11 +1957,6 @@ pg_qualstats_common(PG_FUNCTION_ARGS, pgqsVersion api_version,
 	/* Check we have the expected number of output arguments. */
 	switch (tupdesc->natts)
 	{
-		case PG_QUALSTATS_COLS_V1_0:
-		case PG_QUALSTATS_COLS_V1_0 + PGQS_NAME_COLUMNS:
-			if (api_version != PGQS_V1_0)
-				elog(ERROR, "incorrect number of output arguments");
-			break;
 		case PG_QUALSTATS_COLS_V2_0:
 		case PG_QUALSTATS_COLS_V2_0 + PGQS_NAME_COLUMNS:
 			if (api_version != PGQS_V2_0)
@@ -2120,37 +2061,10 @@ pg_qualstats_common(PG_FUNCTION_ARGS, pgqsVersion api_version,
 			}
 		}
 
-		if (entry->position == -1)
-			nulls[i++] = true;
-		else
-			values[i++] = Int32GetDatum(entry->position);
-
 		if (entry->key.queryid == 0)
 			nulls[i++] = true;
 		else
 			values[i++] = Int64GetDatum(entry->key.queryid);
-
-		if (entry->constvalue[0] != '\0')
-		{
-			if (is_allowed_role || entry->key.userid == userid)
-			{
-				values[i++] = CStringGetTextDatum((char *) pg_do_encoding_conversion(
-							(unsigned char *) entry->constvalue,
-							strlen(entry->constvalue),
-							PG_UTF8,
-							GetDatabaseEncoding()));
-			}
-			else
-			{
-				/*
-				 * Don't show constant text, but hint as to the reason for not
-				 * doing so
-				 */
-				values[i++] = CStringGetTextDatum("<insufficient privilege>");
-			}
-		}
-		else
-			nulls[i++] = true;
 
 		if (entry->key.evaltype)
 			values[i++] = CharGetDatum(entry->key.evaltype);
@@ -2474,15 +2388,8 @@ pgqs_memsize(void)
 	else
 		size = add_size(size, hash_estimate_size(pgqs_max_qual, sizeof(pgqsEntry)));
 
-	if (pgqs_track_constants)
-	{
-		/*
-		 * In that case, we also need an additional struct for storing
-		 * non-normalized queries.
-		 */
-		size = add_size(size, hash_estimate_size(pgqs_max_workload,
-												 sizeof(pgqsWorkloadEntry) + pgqs_query_size * sizeof(char)));
-	}
+	size = add_size(size, hash_estimate_size(pgqs_max_workload,
+											 sizeof(pgqsWorkloadEntry) + pgqs_query_size * sizeof(char)));
 	size = add_size(size, hash_estimate_size(pgqs_max_update,
 											 sizeof(pgqsUpdateHashEntry)));	
 #if PG_VERSION_NUM >= 90600

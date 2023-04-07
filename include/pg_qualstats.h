@@ -95,9 +95,6 @@ typedef struct pgqsEntry
 	Oid			opoid;			/* Operator OID */
 	Oid			rrelid;			/* RHS relation OID or NULL if not var */
 	AttrNumber	rattnum;		/* RHS attribute Number or NULL if not var */
-	char		constvalue[PGQS_CONSTANT_SIZE]; /* Textual representation of
-												 * the right hand constant, if
-												 * any */
 	uint32		qualid;			/* Hash of the parent AND expression if any, 0
 								 * otherwise. */
 	uint32		qualnodeid;		/* Hash of the node itself */
