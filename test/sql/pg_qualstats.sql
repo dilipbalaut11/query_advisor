@@ -10,7 +10,7 @@ CREATE TABLE pgqs AS SELECT id, 'a'::text val FROM generate_series(1, 100000) id
 ANALYZE pgqs;
 SELECT COUNT(*) FROM pgqs WHERE id = 1;
 SELECT lrelid::regclass::text, lattnum, occurences, execution_count,
-    nbfiltered, constvalue, eval_type
+    nbfiltered, eval_type
 FROM query_advisor_qualstats();
 SELECT COUNT(*) > 0 FROM query_advisor_qualstats;
 SELECT COUNT(*) > 0 FROM query_advisor_qualstats();
