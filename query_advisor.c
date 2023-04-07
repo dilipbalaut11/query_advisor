@@ -14,6 +14,7 @@
 
 #include "access/relation.h"
 #include "access/xact.h"
+#include "catalog/pg_am_d.h"
 #include "executor/spi.h"
 #include "funcapi.h"
 #include "miscadmin.h"
@@ -42,12 +43,6 @@ PG_FUNCTION_INFO_V1(query_advisor_index_recommendations);
  * are just executed by index advisor in order to evaluate the indexes.
  */
 bool qa_disable_stats = false;
-
-/*
- * Advisor's planner hook will store the cost of the last planned query in
- * 'qa_plan_cost' variable.
- */
-static float qa_plan_cost = 0.0;
 
 /* consider brin only if relation size is over 8 GB */
 #define QA_CONSIDER_BRIN(relpages)	((relpages) > 1024 * 1024)
@@ -216,8 +211,9 @@ static void qa_get_updates(CandidateInfo *candidates,
 static bool qa_generate_index_queries(CandidateInfo *candidates,
 									  int ncandidates, Relation rel);
 static double qa_set_basecost(QueryInfo *queryinfos, int nqueries);
-static bool qa_plan_query(QueryInfo *queryinfo, bool *have_internal_subtxn,
-						  MemoryContext oldcontext, ResourceOwner oldowner);
+static bool qa_plan_query(char *querytext, bool *have_internal_subtxn,
+						  MemoryContext oldcontext, ResourceOwner oldowner,
+						  double *plancost);
 static void qa_compute_index_benefit(IndexAdvisorContext *context,
 									 int nqueries, int *queryidxs);
 static double qa_get_index_overhead(CandidateInfo *cand, Oid idxid);
@@ -1102,6 +1098,7 @@ static double
 qa_set_basecost(QueryInfo *queryinfos, int nqueries)
 {
 	int		i;
+	double	plan_cost;
 	double	total_cost = 0.0;
 	MemoryContext	oldcontext = CurrentMemoryContext;
 	ResourceOwner	oldowner = CurrentResourceOwner;
@@ -1116,12 +1113,15 @@ qa_set_basecost(QueryInfo *queryinfos, int nqueries)
 	for (i = 0; i < nqueries; i++)
 	{
 
-		if (!qa_plan_query(&queryinfos[i], &have_internal_subtxn, oldcontext,
-						   oldowner))
+		if (!qa_plan_query(queryinfos[i].query, &have_internal_subtxn,
+						   oldcontext, oldowner, &plan_cost))
+		{
+			queryinfos[i].failed = true;
 			continue;
+		}
 
-		queryinfos[i].cost = qa_plan_cost;
-		total_cost += qa_plan_cost;
+		queryinfos[i].cost = plan_cost;
+		total_cost += plan_cost;
 	}
 
 	/*
@@ -1170,7 +1170,7 @@ qa_plan_query(const char *query)
 #endif
 
 /*
- * Plan a query stored in queryinfo and store the total cost in qa_plan_cost.
+ * Plan a query stored in 'queryinfo' and store the total cost in '*plancost'.
  * The planning will be performed under a sub-transaction so that if there
  * any change in definition or any object is missing we can ignore the failure
  * and mark the query as failed so that we can avoid any future failure.
@@ -1182,9 +1182,12 @@ qa_plan_query(const char *query)
  * once it has done planning all the queries.
  */
 static bool
-qa_plan_query(QueryInfo *queryinfo, bool *have_internal_subtxn,
-			  MemoryContext oldcontext, ResourceOwner oldowner)
+qa_plan_query(char *querytext, bool *have_internal_subtxn,
+			  MemoryContext oldcontext, ResourceOwner oldowner,
+			  double *plan_cost)
 {
+	bool	result = true;
+
 	/* start a subtransaction if one is not already running */
 	if (!(*have_internal_subtxn))
 	{
@@ -1193,6 +1196,13 @@ qa_plan_query(QueryInfo *queryinfo, bool *have_internal_subtxn,
 		*have_internal_subtxn = true;
 	}
 
+	/*
+	 * Plan query under the try-catch block and abort the subtransaction in
+	 * case of any failure.  Although we have acquired shared lock on the table
+	 * this could fail because even before we acquired the lock it is possible
+	 * that the table definition might have changed after we stored the query
+	 * in workload table.
+	 */
 	PG_TRY();
 	{
 		Oid	   *paramTypes = palloc0(sizeof(Oid));
@@ -1203,7 +1213,6 @@ qa_plan_query(QueryInfo *queryinfo, bool *have_internal_subtxn,
 		List   *queryTreeList = NULL;
 #endif		
 		Query  *query;
-		char   *querytext = queryinfo->query;
 		PlannedStmt *plan;
 
 		parseTreeList = pg_parse_query(querytext);
@@ -1239,7 +1248,11 @@ qa_plan_query(QueryInfo *queryinfo, bool *have_internal_subtxn,
 #endif
 							 0,
 							 NULL);
-		qa_plan_cost = plan->planTree->total_cost;
+
+		if (plan != NULL)
+			*plan_cost = plan->planTree->total_cost;
+		else
+			result = false;
 	}
 	PG_CATCH();
 	{
@@ -1249,14 +1262,11 @@ qa_plan_query(QueryInfo *queryinfo, bool *have_internal_subtxn,
 		MemoryContextSwitchTo(oldcontext);
 		CurrentResourceOwner = oldowner;
 		*have_internal_subtxn = false;
-		queryinfo->failed = true;
+		result = false;
 	}
 	PG_END_TRY();
 
-	if (queryinfo->failed)
-		return false;
-	else
-		return true;
+	return result;
 }
 
 /*
@@ -1340,13 +1350,17 @@ qa_compute_index_benefit(IndexAdvisorContext *context,
 		for (j = 0; j < nqueries; j++)
 		{
 			int		qidx = (queryidxs != NULL) ? queryidxs[j] : j;
+			double	plancost;
 
 			if (queryinfos[qidx].failed)
 				continue;
 
-			if (!qa_plan_query(&queryinfos[qidx], &have_internal_subtxn,
-							   oldcontext, oldowner))
+			if (!qa_plan_query(queryinfos[qidx].query, &have_internal_subtxn,
+							   oldcontext, oldowner, &plancost))
+			{
+				queryinfos[qidx].failed = true;
 				continue;
+			}
 
 			/*
 			 * If the index reduces the cost at least by 5% and the cost with
@@ -1355,10 +1369,10 @@ qa_compute_index_benefit(IndexAdvisorContext *context,
 			 * and update the benefit matrix slot with the plan cost reduction.
 			 * Otherwise, set the benefit to 0.
 			 */
-			if ((qa_plan_cost < queryinfos[qidx].cost * 0.95) &&
-				(qa_plan_cost + cand->overhead < queryinfos[qidx].cost))
+			if ((plancost < queryinfos[qidx].cost * 0.95) &&
+				(plancost + cand->overhead < queryinfos[qidx].cost))
 			{
-				benefit[qidx][i] = queryinfos[qidx].cost - qa_plan_cost;
+				benefit[qidx][i] = queryinfos[qidx].cost - plancost;
 			}
 			else
 				benefit[qidx][i] = 0;
