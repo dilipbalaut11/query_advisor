@@ -181,7 +181,6 @@ static shmem_request_hook_type prev_shmem_request_hook = NULL;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 
 static uint32 pgqs_hash_fn(const void *key, Size keysize);
-static uint32 pgqs_update_hash_fn(const void *key, Size keysize);
 
 #if PG_VERSION_NUM < 90500
 static uint32 pgqs_uint32_hashfn(const void *key, Size keysize);
@@ -191,7 +190,6 @@ bool pgqs_backend = false;
 static int	pgqs_query_size;
 static int	pgqs_max_qual = PGQS_MAX_DEFAULT;		/* max # statements to track */
 static int	pgqs_max_workload = PGQS_MAX_DEFAULT;	/* max # statements to track */
-static int	pgqs_max_update = PGQS_MAX_DEFAULT;		/* max # statements to track */
 
 static bool pgqs_track_pgcatalog = false;	/* track queries on pg_catalog */
 static bool pgqs_resolve_oids = false;	/* resolve oids */
@@ -244,7 +242,6 @@ static uint32 hashExpr(Expr *expr, pgqsWalkerContext *context, bool include_cons
 static void exprRepr(Expr *expr, StringInfo buffer, pgqsWalkerContext *context, bool include_const);
 static void pgqs_set_planstates(PlanState *planstate, pgqsWalkerContext *context);
 static Expr *pgqs_resolve_var(Var *var, pgqsWalkerContext *context);
-static void pgqsInsertOverheadHash(ModifyTable *node, pgqsWalkerContext *context);
 
 
 static inline void pgqs_entry_init(pgqsEntry *entry);
@@ -262,7 +259,6 @@ static Size pgqs_sampled_array_size(void);
 HTAB *pgqs_hash = NULL;
 HTAB *pgqs_workload_hash = NULL;
 pgqsSharedState *pgqs = NULL;
-HTAB *pgqs_update_hash = NULL;
 
 /* Local Hash */
 static HTAB *pgqs_localhash = NULL;
@@ -345,20 +341,6 @@ _PG_init(void)
 							NULL,
 							NULL,
 							NULL);
-
-		DefineCustomIntVariable("query_advisor.max_update_entries",
-							"Sets the maximum number of update quals tracked by pg_qualstats.",
-							NULL,
-							&pgqs_max_update,
-							PGQS_MAX_DEFAULT,
-							100,
-							INT_MAX,
-							pgqs_backend ? PGC_USERSET : PGC_POSTMASTER,
-							0,
-							NULL,
-							NULL,
-							NULL);
-
 
 	DefineCustomRealVariable("query_advisor.sample_rate",
 							 "Sampling rate. 1 means every query, 0.2 means 1 in five queries",
@@ -821,9 +803,6 @@ pgqs_ExecutorEnd(QueryDesc *queryDesc)
 
 			PGQS_LWL_RELEASE(pgqs->querylock);
 		}
-
-		if (nodeTag(queryDesc->plannedstmt->planTree) == T_ModifyTable)
-			pgqsInsertOverheadHash((ModifyTable *) queryDesc->plannedstmt->planTree, context);
 	}
 
 cleanup:
@@ -1702,20 +1681,14 @@ pgqs_backend_mode_startup(void)
 {
 	HASHCTL		info;
 	HASHCTL		queryinfo;
-	HASHCTL		updateinfo;
 
 	memset(&info, 0, sizeof(info));
 	memset(&queryinfo, 0, sizeof(queryinfo));
-	memset(&updateinfo, 0, sizeof(updateinfo));
 	info.keysize = sizeof(pgqsHashKey);
 	info.hcxt = TopMemoryContext;
 	queryinfo.keysize = sizeof(pgqsWorkloadHashKey);
 	queryinfo.entrysize = sizeof(pgqsWorkloadEntry) + pgqs_query_size * sizeof(char);
 	queryinfo.hcxt = TopMemoryContext;
-	updateinfo.keysize = sizeof(pgqsUpdateHashKey);
-	updateinfo.entrysize = sizeof(pgqsUpdateHashEntry);
-	updateinfo.hcxt = TopMemoryContext;
-	updateinfo.hash = pgqs_update_hash_fn;
 
 	if (pgqs_resolve_oids)
 		info.entrysize = sizeof(pgqsEntryWithNames);
@@ -1739,11 +1712,6 @@ pgqs_backend_mode_startup(void)
 #else
 											 HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
 #endif
-
-	pgqs_update_hash = hash_create("pg_update_hash",
-									pgqs_max_update,
-									&updateinfo,
-									HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
 }
 
 #if PG_VERSION_NUM >= 150000
@@ -1765,7 +1733,6 @@ pgqs_shmem_startup(void)
 {
 	HASHCTL		info;
 	HASHCTL		queryinfo;
-	HASHCTL		updateinfo;
 	bool		found;
 
 	Assert(!pgqs_backend);
@@ -1784,13 +1751,9 @@ pgqs_shmem_startup(void)
 						   &found);
 	memset(&info, 0, sizeof(info));
 	memset(&queryinfo, 0, sizeof(queryinfo));
-	memset(&updateinfo, 0, sizeof(updateinfo));
 	info.keysize = sizeof(pgqsHashKey);
 	queryinfo.keysize = sizeof(pgqsWorkloadHashKey);
 	queryinfo.entrysize = sizeof(pgqsWorkloadEntry) + pgqs_query_size * sizeof(char);
-	updateinfo.keysize = sizeof(pgqsUpdateHashKey);
-	updateinfo.entrysize = sizeof(pgqsUpdateHashEntry);
-	updateinfo.hash = pgqs_update_hash_fn;
 
 	if (pgqs_resolve_oids)
 		info.entrysize = sizeof(pgqsEntryWithNames);
@@ -1833,11 +1796,6 @@ pgqs_shmem_startup(void)
 #else
 											 HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
 #endif
-
-	pgqs_update_hash = ShmemInitHash("pg_update_hash",
-									 pgqs_max_update, pgqs_max_update,
-									 &updateinfo,
-									 HASH_ELEM | HASH_FUNCTION | HASH_FIXED_SIZE);
 	LWLockRelease(AddinShmemInitLock);
 }
 
@@ -2221,10 +2179,6 @@ pg_qualstats_status(PG_FUNCTION_ARGS)
 	values[1] = Float4GetDatum((float4) hash_get_num_entries(pgqs_workload_hash) * 100 / pgqs_max_qual);
 	tuplestore_putvalues(tupstore, tupdesc, values, nulls);
 
-	values[0] = CStringGetTextDatum("query_advisor_update_hash");
-	values[1] = Float4GetDatum((float4) hash_get_num_entries(pgqs_update_hash) * 100 / pgqs_max_qual);
-	tuplestore_putvalues(tupstore, tupdesc, values, nulls);
-
 	PGQS_LWL_RELEASE(pgqs->querylock);
 
 	return (Datum) 0;
@@ -2244,20 +2198,6 @@ pgqs_hash_fn(const void *key, Size keysize)
 		hash_uint32((uint32) k->uniquequalnodeid) ^
 		hash_uint32((uint32) k->uniquequalid) ^
 		hash_uint32((uint32) k->evaltype);
-}
-
-/*
- * Calculate hash value for a key
- */
-static uint32
-pgqs_update_hash_fn(const void *key, Size keysize)
-{
-	const pgqsUpdateHashKey *k = (const pgqsUpdateHashKey *) key;
-
-	return hash_uint32((uint32) k->dbid) ^
-		hash_uint32((uint32) k->queryid) ^
-		hash_uint32((uint32) k->relid) ^
-		hash_uint32((uint32) k->attnum);
 }
 
 static void
@@ -2390,8 +2330,6 @@ pgqs_memsize(void)
 
 	size = add_size(size, hash_estimate_size(pgqs_max_workload,
 											 sizeof(pgqsWorkloadEntry) + pgqs_query_size * sizeof(char)));
-	size = add_size(size, hash_estimate_size(pgqs_max_update,
-											 sizeof(pgqsUpdateHashEntry)));	
 #if PG_VERSION_NUM >= 90600
 	size = add_size(size, MAXALIGN(pgqs_sampled_array_size()));
 #endif
@@ -2547,71 +2485,3 @@ pgqs_uint32_hashfn(const void *key, Size keysize)
 	return ((pgqsWorkloadHashKey *) key)->queryid;
 }
 #endif
-
-static void
-pgqsInsertOverheadHash(ModifyTable *node, pgqsWalkerContext *context)
-{
-#if PG_VERSION_NUM >= 160000
-	ListCell	*l;
-	RangeTblEntry *rte;
-	Instrumentation *instrumentation = context->planstate->instrument;
-
-	/* TODO: for now only consider update overhead. */
-	if (node->operation != CMD_UPDATE)
-		return;
-
-	PGQS_LWL_ACQUIRE(pgqs->querylock, LW_EXCLUSIVE);
-	foreach(l, node->resultRelations)
-	{
-		Index					resultRelation = lfirst_int(l);
-		pgqsUpdateHashKey		key;
-		pgqsUpdateHashEntry	   *entry;
-		List		*cols;
-		ListCell	*lc;
-
-		rte = list_nth(context->rtable, resultRelation - 1);
-		cols = (List *) list_nth(node->updateColnosLists, resultRelation - 1);
-
-		memset(&key, 0, sizeof(pgqsUpdateHashKey));
-		key.dbid = MyDatabaseId;
-		key.relid = rte->relid;	
-		foreach(lc, cols)
-		{
-			AttrNumber	targetattnum = lfirst_int(lc);
-			bool		found;
-
-			key.attnum = targetattnum;
-			key.queryid = context->queryId;
-
-			if (hash_get_num_entries(pgqs_update_hash) + 1 >= pgqs_max_update)
-			{
-				ereport(WARNING,
-						(errcode(ERRCODE_OUT_OF_MEMORY),
-						 errmsg("update hash table is full so current updates are skipped"),
-						 errhint("reset the stats or increase value of pgqs_max_update and restart")));
-
-				PGQS_LWL_RELEASE(pgqs->querylock);
-
-				return;
-			}
-
-			entry = (pgqsUpdateHashEntry *) hash_search(pgqs_update_hash,
-														&key,
-														HASH_ENTER, &found);
-			if (!found)
-			{
-				entry->frequency = 1;
-				entry->updated_rows = instrumentation->ntuples;
-			}
-			else
-			{
-				entry->frequency++;
-				entry->updated_rows += instrumentation->ntuples;
-			}
-		}
-	}
-	PGQS_LWL_RELEASE(pgqs->querylock);
-#endif
-
-	return;
-}

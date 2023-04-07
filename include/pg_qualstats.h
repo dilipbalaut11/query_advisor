@@ -136,25 +136,9 @@ typedef struct pgqsWorkloadEntry
 	char		querytext[1];
 } pgqsWorkloadEntry;
 
-typedef struct pgqsUpdateHashKey
-{
-	pgqs_queryid 	queryid;	/* query identifier (if set by another plugin */
-	Oid				dbid;		/* database oid. */
-	Oid				relid;		/* relation OID of the updated column */
-	AttrNumber		attnum;		/* attribute Number of the updated column */	
-} pgqsUpdateHashKey;
-
-typedef struct pgqsUpdateHashEntry
-{
-	pgqsUpdateHashKey	key;
-	int		 			frequency;		/* frequency of execution */
-	int64				updated_rows;	/* total commulative updated rows */
-} pgqsUpdateHashEntry;
-
 /* Global Hash */
 extern HTAB *pgqs_hash;
 extern HTAB *pgqs_workload_hash;
 extern pgqsSharedState *pgqs;
-extern HTAB *pgqs_update_hash;
 
 #endif

@@ -66,9 +66,6 @@ typedef struct CandidateInfo
 	int	   *attnum;			/* key attribute number array */
 	int		nqueryids;		/* number of queryids related to this index */
 	int64  *queryids;		/* queryids array */
-	int64	nupdates;		/* total number of update done on key attributes
-							   involved in this candididate */
-	int		nupdatefreq;	/* frequency of the updates on candidate keys */
 	double	overhead;		/* overhead of the candidate */
 	bool	isvalid;		/* is candidate still valid (not rejected)*/
 	bool	isselected;		/* is candidate already selected in final list */
@@ -204,9 +201,6 @@ static bool qa_is_candidate_exists(CandidateInfo *candidates,
 static bool qa_is_index_exists(Relation rel, CandidateInfo *cand);
 static void qa_remove_existing_candidates(CandidateInfo *candidates,
 										  int ncandidates);
-
-static void qa_get_updates(CandidateInfo *candidates,
-						   int ncandidates);
 
 static bool qa_generate_index_queries(CandidateInfo *candidates,
 									  int ncandidates, Relation rel);
@@ -460,12 +454,6 @@ qa_process_rel(FinalIndexInfo *previnxinfos, CandidateInfo *candidates,
 	finalcand = qa_get_final_candidates(candidates, &ncandidates,
 										QA_CONSIDER_BRIN(relpages));
 	qa_remove_existing_candidates(finalcand, ncandidates);
-
-	/*
-	 * Process all the candidates and get the total update count we are
-	 * performing on key attributes for each candidate.
-	 */
-	qa_get_updates(finalcand, ncandidates);
 
 	/*
 	 * Generate index creation statement for each candidate.  We need to output
@@ -971,85 +959,6 @@ qa_remove_existing_candidates(CandidateInfo *candidates,
 }
 
 /*
- * Process each index candidate and compute the number of updated tuple for
- * each index candidates based on the index column update counts.
- */
-static void
-qa_get_updates(CandidateInfo *candidates, int ncandidates)
-{
-#if PG_VERSION_NUM >= 140000
-	HASH_SEQ_STATUS 		hash_seq;
-	int64	   *qrueryid_done;
-	int64		nupdates = 0;
-	int			nupdatefreq = 0;
-	int			nqueryiddone = 0;
-	int			maxqueryids = 50;
-	int			i;
-
-	qrueryid_done = palloc(sizeof(int64) * maxqueryids);
-
-	PGQS_LWL_ACQUIRE(pgqs->querylock, LW_SHARED);
-
-	for (i = 0; i < ncandidates; i++)
-	{
-		pgqsUpdateHashEntry	   *entry;
-		CandidateInfo		   *cand = &candidates[i];
-
-		hash_seq_init(&hash_seq, pgqs_update_hash);
-
-		while ((entry = hash_seq_search(&hash_seq)) != NULL)
-		{
-			int			i;
-
-			if (entry->key.dbid != MyDatabaseId)
-				continue;
-			if (entry->key.relid != cand->relid)
-				continue;
-			for (i = 0; i < cand->nattrs; i++)
-			{
-				if (entry->key.attnum == cand->attnum[i])
-					break;
-			}
-
-			if (i == cand->nattrs)
-				continue;
-
-			for (i = 0; i < nqueryiddone; i++)
-			{
-				if (entry->key.queryid == qrueryid_done[i])
-					break;
-			}
-			if (i < nqueryiddone)
-				continue;
-
-			if (nqueryiddone == maxqueryids)
-			{
-				maxqueryids *= 2;
-				qrueryid_done = repalloc(qrueryid_done, sizeof(int64) * maxqueryids);
-			}
-			qrueryid_done[nqueryiddone++] = entry->key.queryid;
-
-			/* average update per query. */
-			nupdates += entry->updated_rows;
-			nupdatefreq += entry->frequency;
-		}
-
-		if (nupdates > 0)
-		{
-			cand->nupdates = nupdates / nupdatefreq;
-			cand->nupdatefreq = nupdatefreq;
-		}
-
-		nupdates = 0;
-		nupdatefreq = 0;
-		nqueryiddone = 0;
-	}
-
-	PGQS_LWL_RELEASE(pgqs->querylock);
-#endif
-}
-
-/*
  * Generate index creation statement for each candidate and store in the index
  * candidate structure for later use.
  */
@@ -1406,26 +1315,15 @@ qa_compute_index_benefit(IndexAdvisorContext *context,
 static double
 qa_get_index_overhead(CandidateInfo *cand, BlockNumber relpages)
 {
-	double		T = relpages;
-	double		index_pages;
-	double		update_io_cost;
-	double		update_cpu_cost;
-	double		overhead;
-	int			navgupdate = cand->nupdates;
-	int			nfrequency = cand->nupdatefreq;
+	double	overhead;
 
 	/*
-	 * We are commputing the page acccess cost and tuple cost based on total
-	 * accumulated tuple count so we don't need to use update query frequency.
+	 * XXX for now we are not computing the overhead based on the index column
+	 * update but it would be good to do in future versions.
 	 */
-	index_pages = (2 * T * navgupdate) / (2 * T + navgupdate);
-	update_io_cost = (index_pages * nfrequency) * random_page_cost;
-	update_cpu_cost = (navgupdate * nfrequency) * cpu_tuple_cost;
 
-	overhead = update_io_cost + update_cpu_cost;
-
-	/* XXX overhead of index based on index size and the number of columns. */
-	overhead += T;
+	/* overhead of index based on index size and the number of columns. */
+	overhead = relpages;
 	overhead += (cand->nattrs * 1000);
 
 	return overhead;
