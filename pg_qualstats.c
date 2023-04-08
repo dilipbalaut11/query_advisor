@@ -35,6 +35,7 @@
 #if PG_VERSION_NUM >= 100000 && PG_VERSION_NUM < 110000
 #include "catalog/pg_authid.h"
 #endif
+#include "catalog/namespace.h"
 #if PG_VERSION_NUM >= 110000
 #include "catalog/pg_authid_d.h"
 #endif
@@ -786,10 +787,19 @@ pgqs_ExecutorEnd(QueryDesc *queryDesc)
 				/* Make sure it wasn't added by another backend */
 				if (!excl_found)
 				{
-					if (queryDesc->estate->es_top_eflags & EXEC_FLAG_EXPLAIN_ONLY)
-						queryEntry->isExplain = true;
-					else
-						queryEntry->isExplain = false;
+					int			num_oids = 0;
+					ListCell   *lc;
+					List	   *search_path_oids = fetch_search_path(false);
+
+					if (list_length(search_path_oids) > MAX_CACHED_PATH_LEN)
+						goto cleanup;
+
+					foreach(lc, search_path_oids)
+						queryEntry->search_path[num_oids++] = lfirst_oid(lc);
+
+					list_free(search_path_oids);
+
+					queryEntry->num_oids = num_oids;
 
 					queryEntry->qrylen = len;
 					strcpy(queryEntry->querytext, context->querytext);

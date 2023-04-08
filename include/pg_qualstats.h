@@ -122,12 +122,16 @@ typedef struct pgqsWorkloadHashKey
 	pgqs_queryid queryid;
 } pgqsWorkloadHashKey;
 
+#define MAX_CACHED_PATH_LEN		16
+
 typedef struct pgqsWorkloadEntry
 {
 	pgqsWorkloadHashKey key;
 	int			frequency;
 	bool		isExplain;		
 	int			qrylen;
+	int			num_oids;
+	Oid			search_path[MAX_CACHED_PATH_LEN];
 
 	/*
 	 * Imperatively at the end of the struct This is actually of length

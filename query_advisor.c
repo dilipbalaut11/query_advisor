@@ -15,6 +15,7 @@
 #include "access/relation.h"
 #include "access/xact.h"
 #include "catalog/pg_am_d.h"
+#include "catalog/pg_namespace.h"
 #include "executor/spi.h"
 #include "funcapi.h"
 #include "miscadmin.h"
@@ -22,6 +23,8 @@
 #include "optimizer/plancat.h"
 #include "parser/analyze.h"
 #include "utils/builtins.h"
+#include "utils/lsyscache.h"
+#include "utils/syscache.h"
 
 #include "include/hypopg.h"
 #include "include/hypopg_index.h"
@@ -80,6 +83,7 @@ typedef struct QueryInfo
 	int		frequency;		/* frequency of the execution */
 	bool	failed;			/* query execution failed do not try again */
 	char   *query;			/* actual query text */
+	char   *seach_path;
 } QueryInfo;
 
 /*
@@ -191,7 +195,7 @@ static QueryInfo *qa_get_queries(CandidateInfo *candidates,
 								 int ncandidates, int *nqueries);
 static bool qa_is_queryid_exists(int64 *queryids, int nqueryids,
 								 int64 queryid, int *idx);
-static char *qa_get_query(int64 queryid, int *freq);
+static void qa_get_query(int64 queryid, QueryInfo *qinfo);
 static CandidateInfo *qa_get_final_candidates(CandidateInfo *candidates,
 											  int *ncandidates,
 											  bool consider_brin);
@@ -205,7 +209,7 @@ static void qa_remove_existing_candidates(CandidateInfo *candidates,
 static bool qa_generate_index_queries(CandidateInfo *candidates,
 									  int ncandidates, Relation rel);
 static double qa_set_basecost(QueryInfo *queryinfos, int nqueries);
-static bool qa_plan_query(char *querytext, bool *have_internal_subtxn,
+static bool qa_plan_query(QueryInfo *qinfo, bool *have_internal_subtxn,
 						  MemoryContext oldcontext, ResourceOwner oldowner,
 						  double *plancost);
 static void qa_compute_index_benefit(IndexAdvisorContext *context,
@@ -695,8 +699,7 @@ qa_get_queries(CandidateInfo *candidates, int ncandidates,
 	/* get the actual query and execution frequency for each queryid */
 	for (i = 0; i < nids; i++)
 	{
-		queryinfos[i].query = qa_get_query(queryids[i],
-										   &queryinfos[i].frequency);
+		qa_get_query(queryids[i], &queryinfos[i]);
 #ifdef DEBUG_INDEX_ADVISOR
 		elog(NOTICE, "query %d: %s-freq:%d", i, queryinfos[i].query, queryinfos[i].frequency);
 #endif
@@ -727,12 +730,11 @@ qa_is_queryid_exists(int64 *queryids, int nqueryids, int64 queryid,
 	return false;
 }
 
-static char *
-qa_get_query(int64 queryid, int *freq)
+static void
+qa_get_query(int64 queryid, QueryInfo *qinfo)
 {
 	pgqsWorkloadEntry   *entry;
 	pgqsWorkloadHashKey	queryKey;
-	char   *query = NULL;
 	bool	found;
 
 	queryKey.queryid = queryid;
@@ -743,17 +745,39 @@ qa_get_query(int64 queryid, int *freq)
 	if (!found)
 	{
 		PGQS_LWL_RELEASE(pgqs->querylock);
-		return NULL;
+		return;
 	}
 
-	query = palloc0(entry->qrylen);
-	strcpy(query, entry->querytext);
+	qinfo->query = palloc0(entry->qrylen);
+	strcpy(qinfo->query, entry->querytext);
+	qinfo->frequency = entry->frequency;
 
-	*freq = entry->frequency;
+	if (entry->num_oids > 0)
+	{
+		int		i;
+		bool	first = true;
+		StringInfoData	s;
+
+		initStringInfo(&s);
+		appendStringInfoString(&s, "SET search_path TO ");
+		for (i = 0; i < entry->num_oids; i++)
+		{
+			char	   *nspname;
+
+			nspname = get_namespace_name(entry->search_path[i]);
+			if (nspname)
+			{
+				if (first)
+					first = false;
+				else
+					appendStringInfoChar(&s, ',');
+				appendStringInfoString(&s, quote_identifier(nspname));
+			}
+		}
+		qinfo->seach_path = s.data;
+	}
 
 	PGQS_LWL_RELEASE(pgqs->querylock);
-
-	return query;
 }
 
 /*
@@ -968,7 +992,14 @@ qa_generate_index_queries(CandidateInfo *candidates, int ncandidates,
 {
 	int		i;
 	int		j;
-	StringInfoData buf;
+	StringInfoData	buf;
+	HeapTuple		tuple;
+
+	tuple = SearchSysCache1(NAMESPACEOID, ObjectIdGetDatum(rel->rd_rel->relnamespace));
+	if (!HeapTupleIsValid(tuple))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_SCHEMA),
+				 errmsg("schema with OID %u does not exist", rel->rd_rel->relnamespace)));
 
 	initStringInfo(&buf);
 
@@ -976,7 +1007,8 @@ qa_generate_index_queries(CandidateInfo *candidates, int ncandidates,
 	{
 		CandidateInfo *cand = &candidates[i];
 
-		appendStringInfo(&buf, "CREATE INDEX ON %s USING %s (",
+		appendStringInfo(&buf, "CREATE INDEX ON %s.%s USING %s (",
+						 NameStr(((Form_pg_namespace) GETSTRUCT(tuple))->nspname),
 						 NameStr(rel->rd_rel->relname),
 						 cand->amname);
 
@@ -995,6 +1027,8 @@ qa_generate_index_queries(CandidateInfo *candidates, int ncandidates,
 		strcpy(cand->indexinfo.indexstmt, buf.data);
 		resetStringInfo(&buf);
 	}
+
+	ReleaseSysCache(tuple);
 
 	return true;
 }
@@ -1022,8 +1056,8 @@ qa_set_basecost(QueryInfo *queryinfos, int nqueries)
 	for (i = 0; i < nqueries; i++)
 	{
 
-		if (!qa_plan_query(queryinfos[i].query, &have_internal_subtxn,
-						   oldcontext, oldowner, &plan_cost))
+		if (!qa_plan_query(&queryinfos[i], &have_internal_subtxn, oldcontext,
+						   oldowner, &plan_cost))
 		{
 			queryinfos[i].failed = true;
 			continue;
@@ -1041,7 +1075,7 @@ qa_set_basecost(QueryInfo *queryinfos, int nqueries)
 	 */
 	if (have_internal_subtxn)
 	{
-		ReleaseCurrentSubTransaction();
+		RollbackAndReleaseCurrentSubTransaction();
 		MemoryContextSwitchTo(oldcontext);
 		CurrentResourceOwner = oldowner;
 		have_internal_subtxn = false;
@@ -1091,11 +1125,12 @@ qa_plan_query(const char *query)
  * once it has done planning all the queries.
  */
 static bool
-qa_plan_query(char *querytext, bool *have_internal_subtxn,
+qa_plan_query(QueryInfo *qinfo, bool *have_internal_subtxn,
 			  MemoryContext oldcontext, ResourceOwner oldowner,
 			  double *plan_cost)
 {
 	bool	result = true;
+	char   *querytext = qinfo->query;
 
 	/* start a subtransaction if one is not already running */
 	if (!(*have_internal_subtxn))
@@ -1123,6 +1158,9 @@ qa_plan_query(char *querytext, bool *have_internal_subtxn,
 #endif		
 		Query  *query;
 		PlannedStmt *plan;
+
+		if (qinfo->seach_path != NULL)
+			SPI_execute(qinfo->seach_path, false, false);
 
 		parseTreeList = pg_parse_query(querytext);
 		if (list_length(parseTreeList) != 1)
@@ -1264,7 +1302,7 @@ qa_compute_index_benefit(IndexAdvisorContext *context,
 			if (queryinfos[qidx].failed)
 				continue;
 
-			if (!qa_plan_query(queryinfos[qidx].query, &have_internal_subtxn,
+			if (!qa_plan_query(&queryinfos[qidx], &have_internal_subtxn,
 							   oldcontext, oldowner, &plancost))
 			{
 				queryinfos[qidx].failed = true;
@@ -1296,7 +1334,7 @@ qa_compute_index_benefit(IndexAdvisorContext *context,
 		 */
 		if (have_internal_subtxn)
 		{
-			ReleaseCurrentSubTransaction();
+			RollbackAndReleaseCurrentSubTransaction();
 			MemoryContextSwitchTo(oldcontext);
 			CurrentResourceOwner = oldowner;
 			have_internal_subtxn = false;
