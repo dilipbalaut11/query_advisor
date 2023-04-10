@@ -22,6 +22,7 @@
 #include "optimizer/optimizer.h"
 #include "optimizer/plancat.h"
 #include "parser/analyze.h"
+#include "rewrite/rewriteHandler.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
@@ -1153,9 +1154,7 @@ qa_plan_query(QueryInfo *qinfo, bool *have_internal_subtxn,
 		int		numparam = 0;
 		List   *parseTreeList = NULL;
 		Node   *parseTreeNode;
-#if PG_VERSION_NUM >= 140000		
 		List   *queryTreeList = NULL;
-#endif		
 		Query  *query;
 		PlannedStmt *plan;
 
@@ -1186,9 +1185,11 @@ qa_plan_query(QueryInfo *qinfo, bool *have_internal_subtxn,
 		queryTreeList = pg_rewrite_query(query);
 		if (list_length(queryTreeList) != 1)
 			ereport(ERROR, (errmsg("can only execute a single query")));
-
-		query = (Query *) linitial(queryTreeList);
+#else
+		queryTreeList = QueryRewrite(query);
 #endif
+		query = (Query *) linitial(queryTreeList);
+
 		plan = pg_plan_query(query,
 #if PG_VERSION_NUM >= 130000
 							 querytext,
