@@ -1088,31 +1088,6 @@ qa_set_basecost(QueryInfo *queryinfos, int nqueries)
 	return total_cost;
 }
 
-#if 0
-/* Plan a given query */
-static void
-qa_plan_query(const char *query)
-{
-	StringInfoData	explainquery;
-
-	if (query == NULL)
-		return;
-
-	/*
-	 * Enable hypo index injection so that we can see the cost with the
-	 * hypothetical indexes we have created.
-	 */
-	hypo_is_enabled = true;
-
-	initStringInfo(&explainquery);
-	appendStringInfoString(&explainquery, query);
-	SPI_execute(query, false, 0);
-
-	/* diable hypo index injection */
-	hypo_is_enabled = false;
-}
-#endif
-
 /*
  * Plan a query stored in 'queryinfo' and store the total cost in '*plancost'.
  * The planning will be performed under a sub-transaction so that if there
